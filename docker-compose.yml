@@ -1,0 +1,28 @@
+version: "3.9"
+
+services:
+  reframer:
+    build: .
+    image: ball-reframe:latest
+    container_name: ball-reframe-dev
+    working_dir: /work
+    environment:
+      - VENV_PY=/opt/venv/bin/python
+    volumes:
+      - .:/work
+      - ${HOME}/.cache/ultralytics:/root/.cache/ultralytics
+    entrypoint: ["tail", "-f", "/dev/null"]
+
+  cli:
+    build: .
+    image: ball-reframe:latest
+    working_dir: /work
+    environment:
+      - VENV_PY=/opt/venv/bin/python
+    entrypoint: ["node", "index.js"]
+    volumes:
+      - .:/work
+      - ${HOME}/.cache/ultralytics:/root/.cache/ultralytics
+    command: ["-h"]
+    depends_on:
+      - reframer

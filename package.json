@@ -1,0 +1,32 @@
+{
+  "name": "ball-centered-reframe",
+  "version": "0.1.0",
+  "private": true,
+  "description": "CLI to reframe 16:9 videos to 9:16 keeping the ball centered using YOLOv8",
+  "bin": {
+    "ball-reframe": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/cli.js",
+    "reframe": "node dist/cli.js",
+    "setup": "python3 -m venv .venv && . .venv/bin/activate && pip install -U pip && pip install -r requirements.txt",
+    "docker:build": "docker build -t ball-reframe .",
+    "docker:run": "docker run --rm -v \"$PWD:/work\" -w /work ball-reframe"
+  },
+  "keywords": [
+    "video",
+    "reframe",
+    "yolo",
+    "opencv",
+    "sports-ball",
+    "crop",
+    "node"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.14.10",
+    "typescript": "^5.5.3"
+  }
+}

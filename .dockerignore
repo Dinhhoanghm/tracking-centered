@@ -1,0 +1,11 @@
+node_modules
+.venv
+.git
+__pycache__
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.m4v
+.DS_Store 

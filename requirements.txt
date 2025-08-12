@@ -1,0 +1,8 @@
+ultralytics==8.3.72
+opencv-contrib-python==4.10.0.84
+numpy==1.26.4
+scipy==1.11.4
+filterpy==1.4.5
+torch>=2.2.0
+ torchvision>=0.17.0
+lap>=0.5.12 
