@@ -42,28 +42,19 @@ class OptimizedYoloBallDetector:
         self.model = YOLO(model_name)
         self.device = self._select_device(device)
         self.conf = float(conf)
-        # Prefer moderate imgsz on MPS for speed by default
         if imgsz:
             self.imgsz = int(imgsz)
         else:
             self.imgsz = 640 if self.device == "mps" else None
         self.ball_class_ids = self._resolve_ball_classes()
-        
-        # Control flags (may be overridden by pipeline)
         self.allow_tta_recovery: bool = True
-        
-        # Move model to target device (e.g., MPS on macOS)
         try:
             if hasattr(self.model, "to"):
                 self.model.to(self.device)
         except Exception:
             pass
-        
-        # Target appearance (will be set during bootstrap)
         self.selected_class_id: Optional[int] = None
         self.ref_hist: Optional[np.ndarray] = None
-        
-        # Pre-compile model for faster inference
         self._warmup_model()
 
     def set_target_appearance(self, class_id: Optional[int], ref_hist: Optional[np.ndarray]) -> None:
@@ -86,15 +77,12 @@ class OptimizedYoloBallDetector:
     def _hist_similarity(hist_a: Optional[np.ndarray], hist_b: Optional[np.ndarray]) -> Optional[float]:
         if hist_a is None or hist_b is None:
             return None
-        # Bhattacharyya distance in [0,1], lower is better
         d = float(cv2.compareHist(hist_a.astype('float32'), hist_b.astype('float32'), cv2.HISTCMP_BHATTACHARYYA))
         sim = max(0.0, min(1.0, 1.0 - d))
         return sim
 
     def _warmup_model(self):
-        """Warm up the model with a dummy frame for faster first inference"""
         dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
-        # Try to fuse model layers for speed if supported
         try:
             if hasattr(self.model, "fuse"):
                 self.model.fuse()
@@ -102,7 +90,6 @@ class OptimizedYoloBallDetector:
             pass
         try:
             self.model.predict(source=dummy_frame, verbose=False, device=self.device)
-            # Ensure MPS ops are kicked off and synchronized
             if self.device == "mps":
                 try:
                     import torch  # type: ignore
@@ -129,13 +116,11 @@ class OptimizedYoloBallDetector:
     def _resolve_ball_classes(self) -> List[int]:
         names = getattr(self.model, "names", None)
         if not names:
-            return [32]  # sports ball in COCO
-        # Normalize mapping to id->name
+            return [32]
         if isinstance(names, dict):
             id_to_name = {int(k): str(v).lower() for k, v in names.items()}
         else:
             id_to_name = {i: str(n).lower() for i, n in enumerate(list(names))}
-        # Accepted labels
         allowed_exact = {"sports ball", "basketball", "soccer ball", "tennis ball", "volleyball", "football", "handball", "rugby ball"}
         disallowed_substrings = {"bat", "glove", "racket", "racquet", "helmet"}
         ball_ids: List[int] = []
@@ -143,7 +128,6 @@ class OptimizedYoloBallDetector:
             if name in allowed_exact:
                 ball_ids.append(int(cid))
                 continue
-            # Allow generic 'ball' but avoid items like 'baseball bat', 'baseball glove'
             if "ball" in name:
                 if any(bad in name for bad in disallowed_substrings):
                     continue
@@ -151,34 +135,23 @@ class OptimizedYoloBallDetector:
         return ball_ids or [32]
 
     def _predict_on_optimized(self, frame_bgr: np.ndarray, *, conf: Optional[float] = None, imgsz: Optional[int] = None, use_tta: bool = False) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
-        """Optimized prediction with better preprocessing"""
         h, w = frame_bgr.shape[:2]
-        
-        # Dynamic image sizing for speed vs accuracy balance
         if imgsz is None:
             if h <= 480:
-                imgsz_eff = 320  # Very fast for low res
+                imgsz_eff = 320
             elif h <= 720:
-                imgsz_eff = 480  # Balanced
+                imgsz_eff = 480
             else:
-                imgsz_eff = 480  # Faster default for HD
+                imgsz_eff = 480
         else:
             imgsz_eff = imgsz
-            
-        # Use half precision for speed if available
-        # Avoid half on MPS where it can be slower or unstable
         half = (self.device == "cuda")
-        
         classes_param = [self.selected_class_id] if (self.selected_class_id is not None) else self.ball_class_ids
-        
-        # Light pre-processing for motion blur: mild sharpening + CLAHE when high-accuracy mode
         pre_frame = frame_bgr
         try:
             if use_tta or (imgsz_eff is not None and imgsz_eff >= 960):
-                # Unsharp mask
                 blur = cv2.GaussianBlur(pre_frame, (0, 0), sigmaX=1.0)
                 sharp = cv2.addWeighted(pre_frame, 1.5, blur, -0.5, 0)
-                # CLAHE on L channel
                 lab = cv2.cvtColor(sharp, cv2.COLOR_BGR2LAB)
                 l, a, b = cv2.split(lab)
                 clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -187,20 +160,18 @@ class OptimizedYoloBallDetector:
                 pre_frame = cv2.cvtColor(lab2, cv2.COLOR_LAB2BGR)
         except Exception:
             pre_frame = frame_bgr
-        
         results = self.model.predict(
             source=pre_frame,
             conf=(conf if conf is not None else self.conf),
             verbose=False,
             device=self.device,
             classes=classes_param,
-            iou=0.3,  # Lower IOU to keep small ball detections
+            iou=0.28,
             imgsz=imgsz_eff,
             half=half,
-            augment=bool(use_tta),
-            agnostic_nms=True,  # Faster NMS
+            augment=False,
+            agnostic_nms=True,
         )
-        
         if not results:
             return None
         r = results[0]
@@ -212,28 +183,14 @@ class OptimizedYoloBallDetector:
         xys = boxes.xyxy.cpu().numpy()
         return xys, confs, clss
 
-    def detect_best_bbox_xyxy_in_roi_optimized(
-        self,
-        frame_bgr: np.ndarray,
-        roi_left: int,
-        roi_width: int,
-        pref_center_x: Optional[float] = None,
-        conf_override: Optional[float] = None,
-        imgsz_override: Optional[int] = None,
-        use_tta: bool = False,
-    ) -> Optional[Tuple[float, float, float, float]]:
-        """Optimized ROI detection with better scoring"""
+    def detect_best_bbox_xyxy_in_roi_optimized(self, frame_bgr: np.ndarray, roi_left: int, roi_width: int, pref_center_x: Optional[float] = None, conf_override: Optional[float] = None, imgsz_override: Optional[int] = None, use_tta: bool = False) -> Optional[Tuple[float, float, float, float]]:
         H, W = frame_bgr.shape[:2]
         roi_left = int(max(0, min(roi_left, W - 2)))
         roi_width = int(max(2, min(roi_width, W - roi_left)))
-        
-        # Extract ROI efficiently
         roi = frame_bgr[:, roi_left : roi_left + roi_width]
         out = self._predict_on_optimized(roi, conf=conf_override, imgsz=imgsz_override, use_tta=use_tta)
-        
-        # Multi-scale ROI detect for tiny balls if needed
         if out is None and self.allow_tta_recovery:
-            for scale in (1.5,):  # limit upscale attempts for speed
+            for scale in (1.5,):
                 h, w = roi.shape[:2]
                 if h == 0 or w == 0:
                     break
@@ -241,85 +198,18 @@ class OptimizedYoloBallDetector:
                 out_up = self._predict_on_optimized(roi_up, conf=max(0.10, (conf_override or self.conf) * 0.7), imgsz=imgsz_override, use_tta=False)
                 if out_up is not None:
                     xys, confs, clss = out_up
-                    # Map back to original scale
                     xys = xys / scale
                     out = (xys, confs, clss)
                     break
-        
         out_from_fallback = False
         if out is None:
-            # Fallback: try full-frame with larger resolution and lower conf
             out = self._predict_on_optimized(
                 frame_bgr,
                 conf=max(0.06, (conf_override or self.conf) * 0.5),
                 imgsz=(640 if self.device == 'mps' else max(960, imgsz_override or (self.imgsz or 640))),
-                use_tta=use_tta,
+                use_tta=False,
             )
             out_from_fallback = out is not None
-        # Heavy fallback: tiled scanning across ROI/full-frame for tiny or motion-blurred balls
-        if out is None and self.allow_tta_recovery:
-            # Respect throttling controls if present on pipeline
-            heavy_ok = True
-            try:
-                heavy_ok = (getattr(self, 'heavy_every_frames', 6) <= 1) or ((getattr(self, '_heavy_frame_counter', 0) % max(1, getattr(self, 'heavy_every_frames', 6))) == 0)
-            except Exception:
-                heavy_ok = True
-            if heavy_ok:
-                t_start = time.perf_counter()
-                tiles = min((3 if roi_width > 720 else 2), int(getattr(self, 'heavy_max_tiles', 2)))
-                overlap = 0.2
-                step = max(1, int(roi_width / tiles * (1 - overlap)))
-                candidates = []
-                scanned = 0
-                for t in range(0, roi_width, step):
-                    # Time budget check
-                    if (time.perf_counter() - t_start) * 1000.0 > float(getattr(self, 'heavy_time_budget_ms', 12)):
-                        break
-                    t_left = int(max(0, min(t, roi_width - 2)))
-                    t_right = int(min(roi_width, t_left + int(roi_width / tiles * (1 + overlap))))
-                    if t_right - t_left < 4:
-                        continue
-                    tile = roi[:, t_left:t_right]
-                    out_t = self._predict_on_optimized(
-                        tile,
-                        conf=max(0.05, (conf_override or self.conf) * 0.6),
-                        imgsz=max(640, imgsz_override or (self.imgsz or 640)),
-                        use_tta=True,
-                    )
-                    scanned += 1
-                    if out_t is None:
-                        continue
-                    xys_t, confs_t, clss_t = out_t
-                    for c, cls_id, (x1, y1, x2, y2) in zip(confs_t, clss_t, xys_t):
-                        if int(cls_id) not in self.ball_class_ids:
-                            continue
-                        cx = (x1 + x2) / 2.0 + roi_left + t_left
-                        cy = (y1 + y2) / 2.0
-                        area = max(1.0, float((x2 - x1) * (y2 - y1)))
-                        conf_score = float(c)
-                        # Score similar to main path with preference to pref_center_x
-                        dist_penalty = 1.0
-                        if pref_center_x is not None:
-                            dist = abs(cx - float(pref_center_x))
-                            norm = max(1.0, (t_right - t_left) / 2.5)
-                            dist_penalty = 1.0 / (1.0 + (dist / norm) ** 2)
-                        area_ratio = area / (W * H)
-                        if area_ratio < 0.00003:
-                            area_penalty = 0.35
-                        elif area_ratio > 0.06:
-                            area_penalty = 0.6
-                        else:
-                            area_penalty = 1.0
-                        score = conf_score * (0.6 + 0.2 * dist_penalty) * area_penalty
-                        candidates.append((score, float(x1 + roi_left + t_left), float(y1), float(x2 + roi_left + t_left), float(y2)))
-                if candidates:
-                    candidates.sort(key=lambda x: x[0], reverse=True)
-                    _, bx1, by1, bx2, by2 = candidates[0]
-                    return (bx1, by1, bx2, by2)
-            try:
-                self._heavy_frame_counter = getattr(self, '_heavy_frame_counter', 0) + 1
-            except Exception:
-                pass
         if out is None:
             return None
         xys, confs, clss = out
@@ -329,49 +219,35 @@ class OptimizedYoloBallDetector:
         else:
             roi_left_effective = roi_left
             roi_width_effective = roi_width
-        
         best_score = -1.0
         best_bbox = None
-        
         for c, cls_id, (x1, y1, x2, y2) in zip(confs, clss, xys):
             if int(cls_id) not in self.ball_class_ids:
                 continue
-            
-            # Calculate center and metrics
             cx = (x1 + x2) / 2.0 + roi_left_effective
             cy = (y1 + y2) / 2.0
             area = max(1.0, float((x2 - x1) * (y2 - y1)))
             conf_score = float(c)
-            
-            # Enhanced scoring with multiple factors
             dist_penalty = 1.0
             if pref_center_x is not None:
                 dist = abs(cx - float(pref_center_x))
-                norm = max(1.0, roi_width_effective / 3.0)  # Tighter preference
+                norm = max(1.0, roi_width_effective / 3.0)
                 dist_penalty = 1.0 / (1.0 + (dist / norm) ** 2)
-            
-            # Prefer reasonable ball sizes (not too small/large)
             area_ratio = area / (W * H)
-            if area_ratio < 0.00005:  # Very small
+            if area_ratio < 0.00005:
                 area_penalty = 0.4
-            elif area_ratio < 0.0003:  # Small
+            elif area_ratio < 0.0003:
                 area_penalty = 0.8
-            elif area_ratio > 0.05:  # Too large
+            elif area_ratio > 0.05:
                 area_penalty = 0.7
             else:
                 area_penalty = 1.0
-            
-            # Aspect ratio penalty for non-circular objects
             aspect_ratio = (x2 - x1) / max(1, y2 - y1)
             aspect_penalty = 1.0 / (1.0 + abs(aspect_ratio - 1.0))
-            
-            # Appearance similarity if available
             patch = frame_bgr[int(max(0, y1)):int(min(H, y2)), int(max(0, x1 + roi_left_effective)):int(min(W, x2 + roi_left_effective))] if getattr(self, 'ref_hist', None) is not None else None
             cand_hist = self._compute_hs_hist(patch) if patch is not None else None
             hist_sim = self._hist_similarity(self.ref_hist, cand_hist) if cand_hist is not None else None
             hist_term = (hist_sim if (hist_sim is not None and getattr(self, 'ref_hist', None) is not None) else 0.0)
-            
-            # Combined score with better weighting
             score = (
                 conf_score * 0.45 +
                 conf_score * dist_penalty * 0.25 +
@@ -379,19 +255,56 @@ class OptimizedYoloBallDetector:
                 conf_score * aspect_penalty * 0.1 +
                 (hist_term * 0.1 if getattr(self, 'ref_hist', None) is not None else 0.0)
             )
-            
             if score > best_score:
                 best_score = score
                 best_bbox = (float(x1 + roi_left_effective), float(y1), float(x2 + roi_left_effective), float(y2))
-        
+        return best_bbox
+
+    def detect_best_bbox_xyxy_tiled(self, frame_bgr: np.ndarray, tile_size: int = 480, overlap: int = 80, conf_override: Optional[float] = None, imgsz_override: Optional[int] = None, pref_center_x: Optional[float] = None) -> Optional[Tuple[float, float, float, float]]:
+        H, W = frame_bgr.shape[:2]
+        step = max(32, tile_size - int(overlap))
+        best_bbox = None
+        best_score = -1.0
+        for y in range(0, max(1, H - tile_size + 1), step):
+            for x in range(0, max(1, W - tile_size + 1), step):
+                tile = frame_bgr[y:y+tile_size, x:x+tile_size]
+                out = self._predict_on_optimized(tile, conf=(conf_override or self.conf * 0.8), imgsz=(imgsz_override or max(640, tile_size)), use_tta=True)
+                if out is None:
+                    continue
+                xys, confs, clss = out
+                for c, cls_id, (x1, y1, x2, y2) in zip(confs, clss, xys):
+                    if int(cls_id) not in self.ball_class_ids:
+                        continue
+                    cx = (x1 + x2) / 2.0 + x
+                    cy = (y1 + y2) / 2.0 + y
+                    area = max(1.0, float((x2 - x1) * (y2 - y1)))
+                    conf_score = float(c)
+                    area_ratio = area / (W * H)
+                    if area_ratio < 0.00003:
+                        area_penalty = 0.3
+                    elif area_ratio < 0.0002:
+                        area_penalty = 0.7
+                    elif area_ratio > 0.04:
+                        area_penalty = 0.6
+                    else:
+                        area_penalty = 1.0
+                    aspect_ratio = (x2 - x1) / max(1, y2 - y1)
+                    aspect_penalty = 1.0 / (1.0 + abs(aspect_ratio - 1.0))
+                    dist_penalty = 1.0
+                    if pref_center_x is not None:
+                        dist = abs(cx - float(pref_center_x))
+                        norm = max(1.0, W / 3.0)
+                        dist_penalty = 1.0 / (1.0 + (dist / norm) ** 2)
+                    score = conf_score * 0.5 + conf_score * area_penalty * 0.15 + conf_score * aspect_penalty * 0.1 + conf_score * dist_penalty * 0.25
+                    if score > best_score:
+                        best_score = score
+                        best_bbox = (float(x + x1), float(y + y1), float(x + x2), float(y + y2))
         return best_bbox
 
 
 class EnhancedKalman1D:
-    """Enhanced Kalman filter with velocity and acceleration modeling"""
     def __init__(self, q: float = 0.05, r: float = 4.0) -> None:
         if KalmanFilter is None:
-            # Fallback implementation with acceleration
             self.x = None
             self.v = 0.0
             self.a = 0.0
@@ -399,91 +312,24 @@ class EnhancedKalman1D:
             self.r = float(r)
             self.use_kf = False
         else:
-            # 3-state Kalman: position, velocity, acceleration
             self.kf = KalmanFilter(dim_x=3, dim_z=1)
-            dt = 1.0  # Frame interval
-            
-            # State transition matrix [pos, vel, acc]
+            dt = 1.0
             self.kf.F = np.array([
                 [1, dt, 0.5*dt*dt],
                 [0, 1,  dt],
-                [0, 0,  0.95]  # Acceleration decay
+                [0, 0,  0.95]
             ], dtype=float)
-            
-            self.kf.H = np.array([[1, 0, 0]], dtype=float)  # Measure position only
-            self.kf.P = np.diag([1000.0, 100.0, 10.0])  # Initial uncertainty
-            self.kf.R = np.array([[float(r)]], dtype=float)  # Measurement noise
-            
-            # Process noise with proper correlation
+            self.kf.H = np.array([[1, 0, 0]], dtype=float)
+            self.kf.P = np.diag([1000.0, 100.0, 10.0])
+            self.kf.R = np.array([[float(r)]], dtype=float)
             q_val = float(q)
             self.kf.Q = np.array([
                 [0.25*q_val*dt**4, 0.5*q_val*dt**3, 0.5*q_val*dt**2],
                 [0.5*q_val*dt**3,  q_val*dt**2,     q_val*dt],
                 [0.5*q_val*dt**2,  q_val*dt,        q_val]
             ], dtype=float)
-            
             self.initialized = False
             self.use_kf = True
-
-    def predict(self) -> Optional[float]:
-        if self.use_kf:
-            if not getattr(self, "initialized", False):
-                return None
-            self.kf.predict()
-            return float(self.kf.x[0, 0])
-        else:
-            if self.x is None:
-                return None
-            # Simple physics model
-            self.v += self.a
-            self.x += self.v
-            self.a *= 0.9  # Damping
-            return self.x
-
-    def update(self, measurement: Optional[float]) -> Optional[float]:
-        if measurement is None:
-            return self.predict()
-            
-        if self.use_kf:
-            if not getattr(self, "initialized", False):
-                self.kf.x = np.array([[measurement], [0.0], [0.0]], dtype=float)
-                self.initialized = True
-                return float(self.kf.x[0, 0])
-            self.kf.update(np.array([[measurement]], dtype=float))
-            return float(self.kf.x[0, 0])
-        else:
-            if self.x is None:
-                self.x = float(measurement)
-                self.v = 0.0
-                self.a = 0.0
-            else:
-                new_v = float(measurement - self.x)
-                new_a = new_v - self.v
-                self.x = float(measurement)
-                self.v = 0.7 * self.v + 0.3 * new_v  # Smooth velocity
-                self.a = 0.5 * self.a + 0.5 * new_a  # Smooth acceleration
-            return self.x
-
-    def get_velocity(self) -> float:
-        """Get current velocity estimate"""
-        if self.use_kf and getattr(self, "initialized", False):
-            return float(self.kf.x[1, 0])
-        return self.v if self.v is not None else 0.0
-
-    def set_measurement_variance(self, variance: float) -> None:
-        """Adjust measurement noise variance dynamically (smaller = more trust)."""
-        if self.use_kf:
-            self.kf.R = np.array([[float(variance)]], dtype=float)
-        else:
-            self.r = float(variance)
-
-    def update_with_variance(self, measurement: Optional[float], variance: Optional[float]) -> Optional[float]:
-        """Update with optional per-measurement variance.
-        When variance is None, reuse the last set value.
-        """
-        if variance is not None:
-            self.set_measurement_variance(float(variance))
-        return self.update(measurement)
 
 
 class ParallelBoxTracker:
@@ -722,11 +568,10 @@ class OptimizedReframerPipeline:
         # Three-pass learning settings
         self.three_pass = bool(kwargs.get('three_pass', False))
         self.learn_stride = max(1, int(kwargs.get('learn_stride', 2)))
-        
-        # Heavy fallback throttling controls
-        self.heavy_every_frames = max(1, int(kwargs.get('heavy_every_frames', 6)))
-        self.heavy_max_tiles = max(1, int(kwargs.get('heavy_max_tiles', 2)))
-        self.heavy_time_budget_ms = max(0, int(kwargs.get('heavy_time_budget_ms', 12)))
+        # Tiled detection options
+        self.tiled_detect = bool(kwargs.get('tiled_detect', False))
+        self.tile_size = int(kwargs.get('tile_size', 480))
+        self.tile_overlap = int(kwargs.get('tile_overlap', 80))
 
     def _first_pass_detect_fullframe(self) -> List[Optional[float]]:
         """Per-frame full-frame YOLO detection for highest accuracy, seeded for early centering and with fallback on misses"""
@@ -785,9 +630,8 @@ class OptimizedReframerPipeline:
 
             # 2) Full-frame robust fallback if ROI missed
             if cx_choice is None:
-                # Adapt conf/imgsz with miss count and velocity
-                use_tta = self.allow_tta_recovery and ((misses >= 4) or (vel > 60))
-                big_imgsz = (960 if self.detector.device == 'mps' else (1536 if misses >= 8 or vel > 60 else 960))
+                use_tta = self.allow_tta_recovery and (misses >= 4)
+                big_imgsz = (960 if self.detector.device == 'mps' else (1280 if misses >= 8 else 960))
                 bbox_ff = self.detector.detect_best_bbox_xyxy_in_roi_optimized(
                     frame,
                     roi_left=0,
@@ -801,6 +645,22 @@ class OptimizedReframerPipeline:
                     x1, y1, x2, y2 = bbox_ff
                     cx_choice = float((x1 + x2) / 2.0)
                     flow.init_from_bbox(frame, bbox_ff)
+
+            # 2b) Tiled detection as heavy fallback for blurry/fast balls
+            if cx_choice is None and (self.tiled_detect or vel > 40 or misses >= 4):
+                tile_w = max(320, min(W, int(self.tile_size)))
+                bbox_t = self.detector.detect_best_bbox_xyxy_tiled(
+                    frame,
+                    tile_size=tile_w,
+                    overlap=int(self.tile_overlap),
+                    conf_override=max(0.06, self.detector.conf * 0.6),
+                    imgsz_override=max(640, tile_w),
+                    pref_center_x=prev_cx,
+                )
+                if bbox_t is not None:
+                    x1, y1, x2, y2 = bbox_t
+                    cx_choice = float((x1 + x2) / 2.0)
+                    flow.init_from_bbox(frame, bbox_t)
 
             # 3) If still nothing, try optical flow to bridge gap, else hold last center
             if cx_choice is None:
@@ -1712,10 +1572,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--center-bound", type=int, default=40, help="Half-width of the stickiness bound in pixels (default: 40)")
     parser.add_argument("--three-pass", action="store_true", help="Three-pass pipeline: learn appearance, detect every frame, then crop")
     parser.add_argument("--learn-stride", type=int, default=2, help="Frame stride for appearance learning pass (default: 2)")
-    # Heavy fallback controls
-    parser.add_argument("--heavy-every-frames", type=int, default=6, help="Only run heavy fallbacks every N frames when missing (default: 6)")
-    parser.add_argument("--heavy-max-tiles", type=int, default=2, help="Max tiles to scan per heavy fallback (default: 2)")
-    parser.add_argument("--heavy-time-budget-ms", type=int, default=12, help="Per-frame time budget in ms for heavy fallbacks (default: 12)")
+    parser.add_argument("--tiled-detect", action="store_true", help="Enable tiled detection fallback for blurry/fast balls")
+    parser.add_argument("--tile-size", type=int, default=480, help="Square tile size in pixels for tiled detection")
+    parser.add_argument("--tile-overlap", type=int, default=80, help="Overlap in pixels between tiles for tiled detection")
     return parser.parse_args()
 
 
@@ -1756,9 +1615,9 @@ def main() -> None:
         strict_center=bool(args.strict_center),
         sticky_window=bool(args.sticky_window),
         center_bound_px=int(args.center_bound),
-        heavy_every_frames=int(args.heavy_every_frames),
-        heavy_max_tiles=int(args.heavy_max_tiles),
-        heavy_time_budget_ms=int(args.heavy_time_budget_ms),
+        tiled_detect=bool(args.tiled_detect),
+        tile_size=int(args.tile_size),
+        tile_overlap=int(args.tile_overlap),
     )
     
     pipeline.run()

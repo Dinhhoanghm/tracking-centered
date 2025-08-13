@@ -33,13 +33,17 @@ interface ProcessingArgs {
   useFfmpeg?: boolean;
   detInterval?: number;
   jerk?: number;
-  strictCenter?: boolean; // added
+  strictCenter?: boolean;
   stickyWindow?: boolean;
   centerBound?: number;
   detectEveryFrame?: boolean;
   fullDetect?: boolean;
   threePass?: boolean;
   learnStride?: number;
+  // new tiled detection
+  tiledDetect?: boolean;
+  tileSize?: number;
+  tileOverlap?: number;
 }
 
 class ArgsParser {
@@ -109,58 +113,58 @@ Examples:
     const args: ProcessingArgs = {};
     for (let i = 2; i < argv.length; i++) {
       const a = argv[i];
-      const next = () => argv[++i];
+      const next = () => argv[++i]!;
       switch (a) {
         case "-i":
         case "--input":
-          args.input = next()!;
+          args.input = next();
           break;
         case "-o":
         case "--output":
-          args.output = next()!;
+          args.output = next();
           break;
         case "--model":
-          args.model = next()!;
+          args.model = next();
           break;
         case "--height":
-          args.height = parseInt(next()!);
+          args.height = parseInt(next());
           break;
         case "--fps":
-          args.fps = parseInt(next()!);
+          args.fps = parseInt(next());
           break;
         case "--smooth":
-          args.smooth = parseInt(next()!);
+          args.smooth = parseInt(next());
           break;
         case "--max-move":
-          args.maxMove = parseInt(next()!);
+          args.maxMove = parseInt(next());
           break;
         case "--max-accel":
-          args.maxAccel = parseInt(next()!);
+          args.maxAccel = parseInt(next());
           break;
         case "--margin":
-          args.margin = parseInt(next()!);
+          args.margin = parseInt(next());
           break;
         case "--deadband":
-          args.deadband = parseInt(next()!);
+          args.deadband = parseInt(next());
           break;
         case "--conf":
-          args.conf = parseFloat(next()!);
+          args.conf = parseFloat(next());
           break;
         case "--device":
-          args.device = next()!;
+          args.device = next();
           break;
         case "--tracker":
-          args.tracker = next()!;
+          args.tracker = next();
           break;
         case "--backend":
-          args.backend = next()!;
+          args.backend = next();
           break;
         case "--roi":
         case "--roi-size":
-          args.roiSize = parseInt(next()!);
+          args.roiSize = parseInt(next());
           break;
         case "--bootstrap-frames":
-          args.bootstrapFrames = parseInt(next()!);
+          args.bootstrapFrames = parseInt(next());
           break;
         case "--target-class":
           args.targetClass = next();
@@ -181,16 +185,16 @@ Examples:
           args.quality = true;
           break;
         case "--imgsz":
-          args.imgsz = parseInt(next()!);
+          args.imgsz = parseInt(next());
           break;
         case "--use-ffmpeg":
           args.useFfmpeg = true;
           break;
         case "--det-interval":
-          args.detInterval = parseInt(next()!);
+          args.detInterval = parseInt(next());
           break;
         case "--jerk":
-          args.jerk = parseInt(next()!);
+          args.jerk = parseInt(next());
           break;
         case "--strict-center":
           args.strictCenter = true;
@@ -199,7 +203,7 @@ Examples:
           args.stickyWindow = true;
           break;
         case "--center-bound":
-          args.centerBound = parseInt(next()!);
+          args.centerBound = parseInt(next());
           break;
         case "--detect-every-frame":
           args.detectEveryFrame = true;
@@ -211,7 +215,16 @@ Examples:
           args.threePass = true;
           break;
         case "--learn-stride":
-          args.learnStride = parseInt(next()!);
+          args.learnStride = parseInt(next());
+          break;
+        case "--tiled-detect":
+          args.tiledDetect = true;
+          break;
+        case "--tile-size":
+          args.tileSize = parseInt(next());
+          break;
+        case "--tile-overlap":
+          args.tileOverlap = parseInt(next());
           break;
         case "-h":
         case "--help":
@@ -244,7 +257,6 @@ class PythonRunner {
       process.exit(1);
     }
 
-    // Apply presets
     const args = { ...rawArgs };
     if (args.fast && args.quality) {
       console.warn("Both --fast and --quality provided. Using --quality.");
@@ -296,7 +308,6 @@ class PythonRunner {
   ): string[] {
     const pyArgs = [this.scriptPath, "-i", paths.input, "-o", paths.output];
 
-    // Add optional arguments
     if (args.model) pyArgs.push("--model", args.model);
     if (args.device) pyArgs.push("--device", args.device);
     if (args.height !== undefined) pyArgs.push("--height", String(args.height));
@@ -333,6 +344,11 @@ class PythonRunner {
     if (args.threePass) pyArgs.push("--three-pass");
     if (args.learnStride !== undefined)
       pyArgs.push("--learn-stride", String(args.learnStride));
+    if (args.tiledDetect) pyArgs.push("--tiled-detect");
+    if (args.tileSize !== undefined)
+      pyArgs.push("--tile-size", String(args.tileSize));
+    if (args.tileOverlap !== undefined)
+      pyArgs.push("--tile-overlap", String(args.tileOverlap));
 
     return pyArgs;
   }

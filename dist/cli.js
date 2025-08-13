@@ -207,6 +207,15 @@ Examples:
                 case "--learn-stride":
                     args.learnStride = parseInt(next());
                     break;
+                case "--tiled-detect":
+                    args.tiledDetect = true;
+                    break;
+                case "--tile-size":
+                    args.tileSize = parseInt(next());
+                    break;
+                case "--tile-overlap":
+                    args.tileOverlap = parseInt(next());
+                    break;
                 case "-h":
                 case "--help":
                     args.help = true;
@@ -234,7 +243,6 @@ class PythonRunner {
             console.error(`Input not found: ${inputPath}`);
             process.exit(1);
         }
-        // Apply presets
         const args = { ...rawArgs };
         if (args.fast && args.quality) {
             console.warn("Both --fast and --quality provided. Using --quality.");
@@ -279,7 +287,6 @@ class PythonRunner {
     }
     buildPythonCommand(args, paths) {
         const pyArgs = [this.scriptPath, "-i", paths.input, "-o", paths.output];
-        // Add optional arguments
         if (args.model)
             pyArgs.push("--model", args.model);
         if (args.device)
@@ -338,6 +345,12 @@ class PythonRunner {
             pyArgs.push("--three-pass");
         if (args.learnStride !== undefined)
             pyArgs.push("--learn-stride", String(args.learnStride));
+        if (args.tiledDetect)
+            pyArgs.push("--tiled-detect");
+        if (args.tileSize !== undefined)
+            pyArgs.push("--tile-size", String(args.tileSize));
+        if (args.tileOverlap !== undefined)
+            pyArgs.push("--tile-overlap", String(args.tileOverlap));
         return pyArgs;
     }
 }
