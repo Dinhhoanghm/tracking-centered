@@ -40,10 +40,12 @@ interface ProcessingArgs {
   fullDetect?: boolean;
   threePass?: boolean;
   learnStride?: number;
-  // new tiled detection
+  // tiled detection
   tiledDetect?: boolean;
   tileSize?: number;
   tileOverlap?: number;
+  // new preset
+  maxAccuracy?: boolean;
 }
 
 class ArgsParser {
@@ -226,6 +228,9 @@ Examples:
         case "--tile-overlap":
           args.tileOverlap = parseInt(next());
           break;
+        case "--max-accuracy":
+          args.maxAccuracy = true;
+          break;
         case "-h":
         case "--help":
           args.help = true;
@@ -263,7 +268,23 @@ class PythonRunner {
       args.fast = false;
     }
 
-    if (args.fast) {
+    if (args.maxAccuracy) {
+      args.model = args.model || "yolov8x.pt";
+      args.imgsz = args.imgsz ?? 1536;
+      args.conf = args.conf ?? 0.12;
+      args.useFfmpeg = args.useFfmpeg ?? true;
+      args.profile = args.profile ?? true;
+      args.threePass = true;
+      args.fullDetect = true;
+      args.detectEveryFrame = true;
+      args.strictCenter = true;
+      args.smooth = args.smooth ?? 17;
+      args.tiledDetect = true;
+      args.tileSize = args.tileSize ?? 512;
+      args.tileOverlap = args.tileOverlap ?? 128;
+      args.backend = args.backend || "yolo-bytetrack";
+      args.noTtaRecovery = args.noTtaRecovery ?? false;
+    } else if (args.fast) {
       args.model = args.model || "yolov8n.pt";
       args.backend = args.backend || "yolo-bytetrack";
       args.smooth = args.smooth ?? 9;

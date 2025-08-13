@@ -35,6 +35,88 @@ class VideoMeta:
     num_frames: int
 
 
+class BlurTemplateBank:
+    """Keeps a small bank of grayscale templates (sharp + blurred) for NCC matching on blurry frames."""
+    def __init__(self, enabled: bool = True, max_templates: int = 12, min_similarity: float = 0.35) -> None:
+        self.enabled = bool(enabled)
+        self.max_templates = int(max_templates)
+        self.min_similarity = float(min_similarity)
+        self.templates: List[np.ndarray] = []  # normalized float32 32x32
+
+    @staticmethod
+    def _to_gray_patch(frame_bgr: np.ndarray, bbox: Tuple[float, float, float, float], pad_scale: float = 0.35) -> Optional[np.ndarray]:
+        h, w = frame_bgr.shape[:2]
+        x1, y1, x2, y2 = bbox
+        bw = float(max(2.0, x2 - x1))
+        bh = float(max(2.0, y2 - y1))
+        cx = (x1 + x2) / 2.0
+        cy = (y1 + y2) / 2.0
+        pad_w = bw * pad_scale
+        pad_h = bh * pad_scale
+        x1p = int(max(0, math.floor(cx - bw/2 - pad_w)))
+        x2p = int(min(w, math.ceil(cx + bw/2 + pad_w)))
+        y1p = int(max(0, math.floor(cy - bh/2 - pad_h)))
+        y2p = int(min(h, math.ceil(cy + bh/2 + pad_h)))
+        if x2p <= x1p or y2p <= y1p:
+            return None
+        roi = frame_bgr[y1p:y2p, x1p:x2p]
+        if roi.size == 0:
+            return None
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        gray = cv2.resize(gray, (32, 32), interpolation=cv2.INTER_AREA)
+        return gray
+
+    @staticmethod
+    def _normalize(im: np.ndarray) -> np.ndarray:
+        imf = im.astype(np.float32)
+        mean = float(imf.mean())
+        std = float(imf.std())
+        if std < 1e-6:
+            std = 1.0
+        return (imf - mean) / std
+
+    def maybe_add(self, frame_bgr: Optional[np.ndarray], bbox: Optional[Tuple[float, float, float, float]]) -> None:
+        if not self.enabled or frame_bgr is None or bbox is None:
+            return
+        try:
+            base = self._to_gray_patch(frame_bgr, bbox)
+            if base is None:
+                return
+            variants = [base]
+            # Add blurred variants to be robust to motion blur
+            try:
+                variants.append(cv2.GaussianBlur(base, (0, 0), 1.2))
+                variants.append(cv2.GaussianBlur(base, (0, 0), 2.0))
+            except Exception:
+                pass
+            for v in variants:
+                templ = self._normalize(v)
+                self.templates.append(templ)
+            if len(self.templates) > self.max_templates:
+                self.templates = self.templates[-self.max_templates:]
+        except Exception:
+            return
+
+    def similarity(self, frame_bgr: np.ndarray, bbox: Tuple[float, float, float, float]) -> float:
+        if not self.enabled or not self.templates:
+            return 0.0
+        try:
+            patch = self._to_gray_patch(frame_bgr, bbox)
+            if patch is None:
+                return 0.0
+            patch_n = self._normalize(patch)
+            best = 0.0
+            for t in self.templates:
+                # normalized cross correlation: mean of elementwise product since both are normalized
+                sim = float((t * patch_n).mean())
+                if sim > best:
+                    best = sim
+            # Map from [-1,1] to [0,1]
+            return max(0.0, min(1.0, (best + 1.0) * 0.5))
+        except Exception:
+            return 0.0
+
+
 class OptimizedYoloBallDetector:
     def __init__(self, model_name: str, device: Optional[str], conf: float, imgsz: Optional[int]) -> None:
         if YOLO is None:
@@ -55,6 +137,8 @@ class OptimizedYoloBallDetector:
             pass
         self.selected_class_id: Optional[int] = None
         self.ref_hist: Optional[np.ndarray] = None
+        # Optional external template bank injected by pipeline
+        self.template_bank: Optional[BlurTemplateBank] = None
         self._warmup_model()
 
     def set_target_appearance(self, class_id: Optional[int], ref_hist: Optional[np.ndarray]) -> None:
@@ -169,7 +253,7 @@ class OptimizedYoloBallDetector:
             iou=0.28,
             imgsz=imgsz_eff,
             half=half,
-            augment=False,
+            augment=use_tta,
             agnostic_nms=True,
         )
         if not results:
@@ -220,7 +304,7 @@ class OptimizedYoloBallDetector:
             roi_left_effective = roi_left
             roi_width_effective = roi_width
         best_score = -1.0
-        best_bbox = None
+        best_bbox: Optional[Tuple[float, float, float, float]] = None
         for c, cls_id, (x1, y1, x2, y2) in zip(confs, clss, xys):
             if int(cls_id) not in self.ball_class_ids:
                 continue
@@ -248,12 +332,23 @@ class OptimizedYoloBallDetector:
             cand_hist = self._compute_hs_hist(patch) if patch is not None else None
             hist_sim = self._hist_similarity(self.ref_hist, cand_hist) if cand_hist is not None else None
             hist_term = (hist_sim if (hist_sim is not None and getattr(self, 'ref_hist', None) is not None) else 0.0)
+            # Template similarity term (if bank is available)
+            templ_term = 0.0
+            try:
+                bank = getattr(self, 'template_bank', None)
+                if bank is not None and best_bbox is None:  # compute on candidate crop
+                    templ_bbox = (float(x1 + roi_left_effective), float(y1), float(x2 + roi_left_effective), float(y2))
+                    sim = float(bank.similarity(frame_bgr, templ_bbox))
+                    templ_term = sim
+            except Exception:
+                templ_term = 0.0
             score = (
-                conf_score * 0.45 +
-                conf_score * dist_penalty * 0.25 +
+                conf_score * 0.40 +
+                conf_score * dist_penalty * 0.22 +
                 conf_score * area_penalty * 0.1 +
-                conf_score * aspect_penalty * 0.1 +
-                (hist_term * 0.1 if getattr(self, 'ref_hist', None) is not None else 0.0)
+                conf_score * aspect_penalty * 0.08 +
+                (hist_term * 0.1 if getattr(self, 'ref_hist', None) is not None else 0.0) +
+                (templ_term * 0.1 if templ_term is not None else 0.0)
             )
             if score > best_score:
                 best_score = score
@@ -496,6 +591,98 @@ class OpticalFlowAssist:
         return self.prev_center_x + dx_med
 
 
+class PredictiveSearchLayer:
+    """Predictive recovery layer: predicts next center and searches targeted regions when detection misses."""
+    def __init__(self, detector: OptimizedYoloBallDetector, template_bank: Optional[BlurTemplateBank]) -> None:
+        self.detector = detector
+        self.template_bank = template_bank
+        self.history: List[float] = []
+
+    def update_history(self, cx: Optional[float]) -> None:
+        if cx is None:
+            return
+        self.history.append(float(cx))
+        if len(self.history) > 1200:
+            self.history = self.history[-1200:]
+
+    def predict_next_cx(self) -> Optional[float]:
+        n = len(self.history)
+        if n == 0:
+            return None
+        if n >= 3:
+            xs = np.arange(n, dtype=float)
+            ys = np.array(self.history, dtype=float)
+            try:
+                coeffs = np.polyfit(xs[-6:] if n>=6 else xs, ys[-6:] if n>=6 else ys, deg=2)
+                x_next = float(n)
+                return float(coeffs[0]*x_next*x_next + coeffs[1]*x_next + coeffs[2])
+            except Exception:
+                pass
+        if n >= 2:
+            v = float(self.history[-1] - self.history[-2])
+            return float(self.history[-1] + v)
+        return float(self.history[-1])
+
+    def recover(self, frame: np.ndarray, prev_cx: Optional[float], vel: float, misses: int, frame_w: int, base_roi: int) -> Optional[Tuple[float, float, float, float]]:
+        H, W = frame.shape[:2]
+        pred = self.predict_next_cx() or prev_cx or (W / 2.0)
+        # 1) Targeted ROI detect around predicted center
+        roi_w = int(max(200, min(W, base_roi + (vel * 2.5))))
+        roi_half = roi_w // 2
+        roi_left = int(max(0, min(int(round(pred)) - roi_half, W - roi_w)))
+        bbox = self.detector.detect_best_bbox_xyxy_in_roi_optimized(
+            frame,
+            roi_left=roi_left,
+            roi_width=roi_w,
+            pref_center_x=pred,
+            conf_override=max(0.08, self.detector.conf * (0.7 if misses >= 3 else 0.85)),
+            imgsz_override=(960 if self.detector.device == 'mps' else (1280 if vel > 40 else 960)),
+            use_tta=(vel > 40 and self.detector.allow_tta_recovery),
+        )
+        if bbox is not None:
+            return bbox
+        # 2) Banded tiled detect around predicted center
+        band_w = int(min(W, max(base_roi * 2, 640)))
+        left = int(max(0, min(int(round(pred - band_w / 2)), W - band_w)))
+        strip = frame[:, left:left+band_w]
+        bbox_t = self.detector.detect_best_bbox_xyxy_tiled(
+            strip,
+            tile_size=min(512, band_w),
+            overlap=96,
+            conf_override=max(0.06, self.detector.conf * 0.6),
+            imgsz_override=max(640, min(960, band_w)),
+            pref_center_x=(pred - left),
+        )
+        if bbox_t is not None:
+            x1, y1, x2, y2 = bbox_t
+            return (float(x1 + left), float(y1), float(x2 + left), float(y2))
+        # 3) NCC template search in band as last resort
+        try:
+            if self.template_bank is not None and getattr(self.template_bank, 'templates', None):
+                search = cv2.cvtColor(strip, cv2.COLOR_BGR2GRAY).astype(np.float32)
+                best = -1.0
+                best_x = None
+                for templ in self.template_bank.templates:
+                    t = (templ * templ.std() + templ.mean()).astype(np.float32)
+                    try:
+                        res = cv2.matchTemplate(search, t, cv2.TM_CCOEFF_NORMED)
+                        _, maxv, _, maxl = cv2.minMaxLoc(res)
+                        if float(maxv) > best:
+                            best = float(maxv)
+                            best_x = left + float(maxl[0] + t.shape[1] / 2.0)
+                    except Exception:
+                        continue
+                if best_x is not None and best >= 0.3:
+                    cx = float(best_x)
+                    bw = max(12.0, base_roi * 0.05)
+                    x1 = max(0.0, cx - bw/2)
+                    x2 = min(float(W), cx + bw/2)
+                    return (x1, float(H)*0.45, x2, float(H)*0.55)
+        except Exception:
+            pass
+        return None
+
+
 class OptimizedReframerPipeline:
     def __init__(self, **kwargs):
         # Copy all existing parameters
@@ -572,6 +759,16 @@ class OptimizedReframerPipeline:
         self.tiled_detect = bool(kwargs.get('tiled_detect', False))
         self.tile_size = int(kwargs.get('tile_size', 480))
         self.tile_overlap = int(kwargs.get('tile_overlap', 80))
+        # Blur template learning
+        self.use_blur_templates = True
+        self.template_bank = BlurTemplateBank(enabled=True, max_templates=16, min_similarity=0.35)
+        # Attach bank to detector
+        try:
+            self.detector.template_bank = self.template_bank
+        except Exception:
+            pass
+        # Predictive recovery layer
+        self.predict_layer = PredictiveSearchLayer(self.detector, self.template_bank)
 
     def _first_pass_detect_fullframe(self) -> List[Optional[float]]:
         """Per-frame full-frame YOLO detection for highest accuracy, seeded for early centering and with fallback on misses"""
@@ -598,6 +795,11 @@ class OptimizedReframerPipeline:
             H, W = frame.shape[:2]
             # Estimate velocity from previous centers to size ROI
             vel = abs((prev_cx - prev_prev_cx)) if (prev_cx is not None and prev_prev_cx is not None) else 0.0
+            # Predict next center to guide detection
+            try:
+                pred_cx = self.predict_layer.predict_next_cx() or (prev_cx if prev_cx is not None else (W / 2.0))
+            except Exception:
+                pred_cx = prev_cx if prev_cx is not None else (W / 2.0)
             base_roi = int(getattr(self, 'base_roi_width', 400))
             if vel > 60:
                 roi_w = min(W, max(base_roi, base_roi + vel * 4.0))
@@ -611,14 +813,14 @@ class OptimizedReframerPipeline:
 
             cx_choice: Optional[float] = None
             # 1) ROI-first detect around previous center (faster, accurate)
-            if prev_cx is not None:
+            if pred_cx is not None:
                 roi_half = roi_w // 2
-                roi_left = int(max(0, min(int(round(prev_cx)) - roi_half, W - roi_w)))
+                roi_left = int(max(0, min(int(round(pred_cx)) - roi_half, W - roi_w)))
                 bbox = self.detector.detect_best_bbox_xyxy_in_roi_optimized(
                     frame,
                     roi_left=roi_left,
                     roi_width=roi_w,
-                    pref_center_x=prev_cx,
+                    pref_center_x=pred_cx,
                     conf_override=max(0.08, self.detector.conf * 0.8),
                     imgsz_override=(640 if self.detector.device == 'mps' else 960),
                     use_tta=(vel > 60 and self.allow_tta_recovery),
@@ -627,6 +829,11 @@ class OptimizedReframerPipeline:
                     x1, y1, x2, y2 = bbox
                     cx_choice = float((x1 + x2) / 2.0)
                     flow.init_from_bbox(frame, bbox)
+                    # Learn blur templates
+                    try:
+                        self.template_bank.maybe_add(frame, bbox)
+                    except Exception:
+                        pass
 
             # 2) Full-frame robust fallback if ROI missed
             if cx_choice is None:
@@ -636,7 +843,7 @@ class OptimizedReframerPipeline:
                     frame,
                     roi_left=0,
                     roi_width=W,
-                    pref_center_x=prev_cx,
+                    pref_center_x=pred_cx,
                     conf_override=max(0.06, self.detector.conf * (0.6 if misses >= 6 else 0.8)),
                     imgsz_override=big_imgsz,
                     use_tta=use_tta,
@@ -645,6 +852,11 @@ class OptimizedReframerPipeline:
                     x1, y1, x2, y2 = bbox_ff
                     cx_choice = float((x1 + x2) / 2.0)
                     flow.init_from_bbox(frame, bbox_ff)
+                    # Learn blur templates
+                    try:
+                        self.template_bank.maybe_add(frame, bbox_ff)
+                    except Exception:
+                        pass
 
             # 2b) Tiled detection as heavy fallback for blurry/fast balls
             if cx_choice is None and (self.tiled_detect or vel > 40 or misses >= 4):
@@ -655,12 +867,17 @@ class OptimizedReframerPipeline:
                     overlap=int(self.tile_overlap),
                     conf_override=max(0.06, self.detector.conf * 0.6),
                     imgsz_override=max(640, tile_w),
-                    pref_center_x=prev_cx,
+                    pref_center_x=pred_cx,
                 )
                 if bbox_t is not None:
                     x1, y1, x2, y2 = bbox_t
                     cx_choice = float((x1 + x2) / 2.0)
                     flow.init_from_bbox(frame, bbox_t)
+                    # Learn blur templates
+                    try:
+                        self.template_bank.maybe_add(frame, bbox_t)
+                    except Exception:
+                        pass
 
             # 3) If still nothing, try optical flow to bridge gap, else hold last center
             if cx_choice is None:
@@ -668,7 +885,56 @@ class OptimizedReframerPipeline:
                 if cx_flow is not None:
                     cx_choice = float(cx_flow)
                 else:
-                    cx_choice = prev_cx
+                    # Predictive recovery layer attempt
+                    try:
+                        bbox_pred = self.predict_layer.recover(
+                            frame,
+                            prev_cx=pred_cx,
+                            vel=float(vel),
+                            misses=int(misses),
+                            frame_w=W,
+                            base_roi=base_roi,
+                        )
+                        if bbox_pred is not None:
+                            x1, y1, x2, y2 = bbox_pred
+                            cx_choice = float((x1 + x2) / 2.0)
+                            tracker.init_with_bbox(frame, bbox_pred)
+                            flow.init_from_bbox(frame, bbox_pred)
+                            try:
+                                self.template_bank.maybe_add(frame, bbox_pred)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    if cx_choice is None:
+                        # Template NCC search around last center as final recovery
+                        try:
+                            bank = getattr(self, 'template_bank', None)
+                            if bank is not None and getattr(bank, 'templates', None):
+                                Hs, Ws = frame.shape[:2]
+                                search_w = int(min(Ws, max(320, roi_w * 2)))
+                                search_left = int(max(0, (pred_cx or (Ws/2)) - search_w/2))
+                                search_left = min(search_left, Ws - search_w)
+                                search = cv2.cvtColor(frame[:, search_left:search_left+search_w], cv2.COLOR_BGR2GRAY)
+                                search = search.astype(np.float32)
+                                best = -1.0
+                                best_x = None
+                                for templ in bank.templates:
+                                    templ32 = (templ * templ.std() + templ.mean()).astype(np.float32)
+                                    try:
+                                        res = cv2.matchTemplate(search, templ32, cv2.TM_CCOEFF_NORMED)
+                                        minv, maxv, minl, maxl = cv2.minMaxLoc(res)
+                                        if float(maxv) > best:
+                                            best = float(maxv)
+                                            best_x = search_left + float(maxl[0] + templ32.shape[1] / 2.0)
+                                    except Exception:
+                                        continue
+                                if best_x is not None and best >= 0.3:
+                                    cx_choice = float(best_x)
+                        except Exception:
+                            pass
+                    if cx_choice is None:
+                        cx_choice = pred_cx
                 misses += 1
             else:
                 misses = 0
