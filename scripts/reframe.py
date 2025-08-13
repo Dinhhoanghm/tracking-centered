@@ -197,7 +197,7 @@ class OptimizedYoloBallDetector:
             iou=0.3,  # Lower IOU to keep small ball detections
             imgsz=imgsz_eff,
             half=half,
-            augment=False,  # disable TTA by default for speed
+            augment=bool(use_tta),
             agnostic_nms=True,  # Faster NMS
         )
         
@@ -253,9 +253,73 @@ class OptimizedYoloBallDetector:
                 frame_bgr,
                 conf=max(0.06, (conf_override or self.conf) * 0.5),
                 imgsz=(640 if self.device == 'mps' else max(960, imgsz_override or (self.imgsz or 640))),
-                use_tta=False,
+                use_tta=use_tta,
             )
             out_from_fallback = out is not None
+        # Heavy fallback: tiled scanning across ROI/full-frame for tiny or motion-blurred balls
+        if out is None and self.allow_tta_recovery:
+            # Respect throttling controls if present on pipeline
+            heavy_ok = True
+            try:
+                heavy_ok = (getattr(self, 'heavy_every_frames', 6) <= 1) or ((getattr(self, '_heavy_frame_counter', 0) % max(1, getattr(self, 'heavy_every_frames', 6))) == 0)
+            except Exception:
+                heavy_ok = True
+            if heavy_ok:
+                t_start = time.perf_counter()
+                tiles = min((3 if roi_width > 720 else 2), int(getattr(self, 'heavy_max_tiles', 2)))
+                overlap = 0.2
+                step = max(1, int(roi_width / tiles * (1 - overlap)))
+                candidates = []
+                scanned = 0
+                for t in range(0, roi_width, step):
+                    # Time budget check
+                    if (time.perf_counter() - t_start) * 1000.0 > float(getattr(self, 'heavy_time_budget_ms', 12)):
+                        break
+                    t_left = int(max(0, min(t, roi_width - 2)))
+                    t_right = int(min(roi_width, t_left + int(roi_width / tiles * (1 + overlap))))
+                    if t_right - t_left < 4:
+                        continue
+                    tile = roi[:, t_left:t_right]
+                    out_t = self._predict_on_optimized(
+                        tile,
+                        conf=max(0.05, (conf_override or self.conf) * 0.6),
+                        imgsz=max(640, imgsz_override or (self.imgsz or 640)),
+                        use_tta=True,
+                    )
+                    scanned += 1
+                    if out_t is None:
+                        continue
+                    xys_t, confs_t, clss_t = out_t
+                    for c, cls_id, (x1, y1, x2, y2) in zip(confs_t, clss_t, xys_t):
+                        if int(cls_id) not in self.ball_class_ids:
+                            continue
+                        cx = (x1 + x2) / 2.0 + roi_left + t_left
+                        cy = (y1 + y2) / 2.0
+                        area = max(1.0, float((x2 - x1) * (y2 - y1)))
+                        conf_score = float(c)
+                        # Score similar to main path with preference to pref_center_x
+                        dist_penalty = 1.0
+                        if pref_center_x is not None:
+                            dist = abs(cx - float(pref_center_x))
+                            norm = max(1.0, (t_right - t_left) / 2.5)
+                            dist_penalty = 1.0 / (1.0 + (dist / norm) ** 2)
+                        area_ratio = area / (W * H)
+                        if area_ratio < 0.00003:
+                            area_penalty = 0.35
+                        elif area_ratio > 0.06:
+                            area_penalty = 0.6
+                        else:
+                            area_penalty = 1.0
+                        score = conf_score * (0.6 + 0.2 * dist_penalty) * area_penalty
+                        candidates.append((score, float(x1 + roi_left + t_left), float(y1), float(x2 + roi_left + t_left), float(y2)))
+                if candidates:
+                    candidates.sort(key=lambda x: x[0], reverse=True)
+                    _, bx1, by1, bx2, by2 = candidates[0]
+                    return (bx1, by1, bx2, by2)
+            try:
+                self._heavy_frame_counter = getattr(self, '_heavy_frame_counter', 0) + 1
+            except Exception:
+                pass
         if out is None:
             return None
         xys, confs, clss = out
@@ -658,6 +722,11 @@ class OptimizedReframerPipeline:
         # Three-pass learning settings
         self.three_pass = bool(kwargs.get('three_pass', False))
         self.learn_stride = max(1, int(kwargs.get('learn_stride', 2)))
+        
+        # Heavy fallback throttling controls
+        self.heavy_every_frames = max(1, int(kwargs.get('heavy_every_frames', 6)))
+        self.heavy_max_tiles = max(1, int(kwargs.get('heavy_max_tiles', 2)))
+        self.heavy_time_budget_ms = max(0, int(kwargs.get('heavy_time_budget_ms', 12)))
 
     def _first_pass_detect_fullframe(self) -> List[Optional[float]]:
         """Per-frame full-frame YOLO detection for highest accuracy, seeded for early centering and with fallback on misses"""
@@ -716,9 +785,9 @@ class OptimizedReframerPipeline:
 
             # 2) Full-frame robust fallback if ROI missed
             if cx_choice is None:
-                # Adapt conf/imgsz with miss count
-                use_tta = self.allow_tta_recovery and (misses >= 4)
-                big_imgsz = (960 if self.detector.device == 'mps' else (1280 if misses >= 8 else 960))
+                # Adapt conf/imgsz with miss count and velocity
+                use_tta = self.allow_tta_recovery and ((misses >= 4) or (vel > 60))
+                big_imgsz = (960 if self.detector.device == 'mps' else (1536 if misses >= 8 or vel > 60 else 960))
                 bbox_ff = self.detector.detect_best_bbox_xyxy_in_roi_optimized(
                     frame,
                     roi_left=0,
@@ -1643,6 +1712,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--center-bound", type=int, default=40, help="Half-width of the stickiness bound in pixels (default: 40)")
     parser.add_argument("--three-pass", action="store_true", help="Three-pass pipeline: learn appearance, detect every frame, then crop")
     parser.add_argument("--learn-stride", type=int, default=2, help="Frame stride for appearance learning pass (default: 2)")
+    # Heavy fallback controls
+    parser.add_argument("--heavy-every-frames", type=int, default=6, help="Only run heavy fallbacks every N frames when missing (default: 6)")
+    parser.add_argument("--heavy-max-tiles", type=int, default=2, help="Max tiles to scan per heavy fallback (default: 2)")
+    parser.add_argument("--heavy-time-budget-ms", type=int, default=12, help="Per-frame time budget in ms for heavy fallbacks (default: 12)")
     return parser.parse_args()
 
 
@@ -1683,6 +1756,9 @@ def main() -> None:
         strict_center=bool(args.strict_center),
         sticky_window=bool(args.sticky_window),
         center_bound_px=int(args.center_bound),
+        heavy_every_frames=int(args.heavy_every_frames),
+        heavy_max_tiles=int(args.heavy_max_tiles),
+        heavy_time_budget_ms=int(args.heavy_time_budget_ms),
     )
     
     pipeline.run()
