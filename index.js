@@ -122,6 +122,24 @@ function parseArgs(argv) {
       case "--help":
         args.help = true;
         break;
+      case "--enhanced-bootstrap":
+        args.enhancedBootstrap = true;
+        break;
+      case "--detection-confidence-boost":
+        args.detectionConfidenceBoost = parseFloat(next());
+        break;
+      case "--stability-frames":
+        args.stabilityFrames = parseInt(next());
+        break;
+      case "--prediction-lookahead":
+        args.predictionLookahead = parseInt(next());
+        break;
+      case "--multi-roi-detect":
+        args.multiRoiDetect = true;
+        break;
+      case "--ultra-quality":
+        args.ultraQuality = true;
+        break;
       default:
         console.warn(`Unknown arg: ${a}`);
     }

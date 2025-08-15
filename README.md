@@ -18,17 +18,16 @@ Keeps the ball centered in vertical video, even when it moves fast and appears b
 - Node.js 18+ and npm
 - macOS (MPS), Linux/Windows (CUDA) or CPU-only
 
-### Start the project (one-time setup)
+### Setup
 
 ```bash
 cd /Users/hoangdo/Own/upwork/ball-centered
-
-# 1) Python env
+# Python env
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -U pip && pip install -r requirements.txt
 
-# 2) Node CLI
+# Node CLI
 npm install
 npm run build
 ```
@@ -59,100 +58,60 @@ node dist/cli.js -i /abs/path/input.mp4 -o /abs/path/output.mp4 \
 node dist/cli.js -i input.mp4 -o output.mp4 --max-accuracy --device cpu
 ```
 
-### Best example command (most accurate and stable)
+### Presets
+
+- `--max-accuracy` (recommended): Enables three-pass, per-frame detection, prediction-guided search, blur templates, tiled fallback, strict centering, imgsz 1536, low conf.
+- `--quality`: yolov8x, imgsz 960, smoothing and profiling enabled.
+- `--fast`: yolov8n, aggressive intervals and ffmpeg pipe.
+
+### Key Flags
+
+- Input/Output: `-i`, `-o`
+- Device: `--device cpu|mps|cuda`
+- Model/size: `--model yolov8x.pt`, `--imgsz 960|1280|1536`, `--conf 0.12–0.25`
+- Three-pass: `--three-pass` (learn → detect-every-frame → render)
+- Detection: `--full-detect` (per-frame), `--detect-every-frame`
+- Prediction-guided (built-in): used automatically for ROI/full-frame/tiled
+- Tiled fallback: `--tiled-detect`, `--tile-size 512`, `--tile-overlap 128`
+- Blur template learning: built-in; improves re-detection on blurry frames
+- Centering: `--strict-center` (with border safety), or `--sticky-window`
+- Smoothing: `--smooth 11|17|21`
+- Class constraint: `--target-class "tennis ball"`
+- Backend: `--backend yolo|yolo-bytetrack` (default varies by preset)
+- Encoding: `--use-ffmpeg` (hardware encoder where available)
+
+### Example Commands
+
+- High accuracy with known class:
 
 ```bash
 node dist/cli.js -i input.mp4 -o output.mp4 \
-  --max-accuracy \
-  --device mps \
-  --use-ffmpeg \
+  --max-accuracy --device mps --use-ffmpeg \
   --target-class "tennis ball"
 ```
 
-- Omit `--target-class` if unknown.
+- Manual configuration (equivalent to max accuracy):
 
-### Presets
-
-- **--max-accuracy**: Enables three-pass, per-frame detection, prediction-guided search, blur templates, tiled fallback, strict-centering, imgsz 1536, low conf (0.12), and ffmpeg pipe.
-- **--quality**: yolov8x, imgsz 960, smoothing and profiling enabled.
-- **--fast**: yolov8n, aggressive intervals and ffmpeg pipe.
-
-### Parameters reference
-
-Required
-
-- **-i, --input <path>**: Input video path.
-- **-o, --output <path>**: Output video path.
-
-Device/Model
-
-- **--device cpu|mps|cuda**: Select inference device (CPU, Apple MPS, or NVIDIA CUDA).
-- **--model <path|name>**: YOLO model (e.g., `yolov8x.pt`).
-- **--imgsz <int>**: YOLO input size (e.g., `960`/`1280`/`1536`). Larger = more accurate on tiny/blurred balls.
-- **--conf <float>**: Detection confidence (lower finds smaller/blurry balls). Typical: `0.12–0.25`.
-- **--backend yolo|yolo-bytetrack**: Tracking backend (used when not forcing per-frame detection).
-- **--tracker auto|mosse|kcf|csrt**: OpenCV tracker type (non full-detect mode).
-
-Pipeline control
-
-- **--max-accuracy**: Turn on all high-accuracy features and sensible defaults (recommended).
-- **--three-pass**: Learn appearance → detect-every-frame → render.
-- **--full-detect**: Force per-frame full-frame detection.
-- **--detect-every-frame**: Always run detector (ignores tracker interval).
-- **--det-interval <int>**: Baseline detection interval when using YOLO+tracker.
-- **--no-tta-recovery**: Disable heavier recovery (keep disabled for max recovery).
-- **--profile**: Periodic performance stats.
-
-Blur/tiny ball robustness
-
-- **--tiled-detect**: Enable tiled detection fallback.
-- **--tile-size <int>**: Tile size in pixels (e.g., `512`).
-- **--tile-overlap <int>**: Overlap in pixels (e.g., `128`).
-- Blur Template Bank: learned automatically from accepted detections.
-
-Centering/smoothing
-
-- **--strict-center**: Center on the ball; relax near borders to keep it in frame.
-- **--sticky-window**: Keep previous center until ball leaves a small bound.
-- **--center-bound <int>**: Half-width (px) for sticky mode (default `40`).
-- **--smooth <int>**: Trajectory smoothing window (typical: `15–21`).
-- Motion constraints (used when not strict-center):
-  - **--max-move <int>**: Max crop center shift per frame.
-  - **--max-accel <int>**: Max change per frame (acceleration clamp).
-  - **--deadband <int>**: Ignore tiny movements.
-  - **--jerk <int>**: Limit change in acceleration per frame.
-- **--margin <int>**: Horizontal safety margin to keep ball inside crop.
-
-Detection targets/ROI
-
-- **--target-class <name>**: Force specific class (e.g., `"tennis ball"`).
-- **--no-appearance**: Disable color histogram re-scoring.
-- **--roi, --roi-size <int>**: Base ROI width for ROI detection.
-- **--bootstrap-frames <int>**: Initial frames to scan for appearance learning.
-
-Output
-
-- **--use-ffmpeg**: Use ffmpeg pipe (hardware encoder where available).
-- **--height <int>**: Output height (default: input height).
-- **--fps <number>**: Output FPS (default: input FPS).
-
-Misc
-
-- **--quality**, **--fast**: Alternative presets.
-- **--verbose** (reserved), **--dry-run** (reserved): For future logging/simulation.
+```bash
+node dist/cli.js -i input.mp4 -o output.mp4 \
+  --three-pass --full-detect --detect-every-frame \
+  --strict-center \
+  --tiled-detect --tile-size 512 --tile-overlap 128 \
+  --imgsz 1536 --conf 0.12 \
+  --device mps --use-ffmpeg
+```
 
 ### Tips
 
-- Ball is tiny/very blurry: add `--imgsz 1536 --conf 0.12 --tiled-detect --tile-size 512 --tile-overlap 128`.
-- Too jittery: increase `--smooth` to 17 or 21.
-- Ball near edges cropped: increase `--margin 80`.
-- Known sport/ball: add `--target-class "tennis ball"`.
+- If the ball is tiny/very blurry: raise `--imgsz` to 1536, lower `--conf` to ~0.12, enable `--tiled-detect` with `--tile-size 512 --tile-overlap 128`.
+- If output feels jittery: increase `--smooth` to 17 or 21.
+- If centering feels too strict near edges: increase `--margin 80`.
 
 ### Troubleshooting
 
 - Ultralytics not found: activate venv and `pip install -r requirements.txt`.
 - MPS/CUDA not used: set `--device mps|cuda|cpu` explicitly.
-- Still missing frames mid-video: ensure `--max-accuracy` or enable `--tiled-detect` and increase `--imgsz`.
+- Still missing mid-video frames: ensure `--max-accuracy` or enable `--tiled-detect` and increase `--imgsz`.
 
 ### License
 

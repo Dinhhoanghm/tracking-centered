@@ -53,6 +53,7 @@ Performance Options:
   --device <cpu|cuda|mps>   Processing device (auto-detected by default)
   --fast                    Use fastest settings (yolov8n + optimized params)
   --quality                 Use highest quality settings (yolov8x + enhanced params)
+  --max-accuracy            Use maximum accuracy settings (yolov8x + ultra-quality params)
 
 Output Options:
   --height <int>            Output height (default: keep input height)
@@ -84,6 +85,21 @@ Advanced:
   --no-tta-recovery         Disable heavy TTA full-frame recoveries for speed
   --verbose                 Show detailed progress
   --dry-run                 Show command without running
+Edge Handling:
+  --edge-aware              Smart crop positioning when ball is near frame edges
+  --ball-comfort-zone <px>  Minimum distance from ball to crop edge (default: 15% of crop width)
+
+Ball Memory Options:
+  --use-ball-memory         Keep last known ball position when ball disappears (default: true)
+  --no-ball-memory          Disable ball memory system
+  --memory-duration <int>   Frames to remember ball position (default: 90)
+  --memory-decay <float>    Memory confidence decay rate (default: 0.98)
+  --memory-blend <int>      Frames to blend back to detection (default: 15)
+
+  Offscreen Ball Handling:
+  --freeze-on-exit          Freeze crop area when ball exits screen (default: true)
+  --freeze-threshold <int>  Frames of misses before freezing (default: 5)
+  --exit-prediction         Use trajectory prediction for ball return (default: true)
 
 Examples:
   # Basic usage
@@ -94,6 +110,9 @@ Examples:
 
   # High quality
   ball-reframe -i highlights.mp4 -o reframed.mp4 --quality
+
+  # Maximum accuracy
+  ball-reframe -i highlights.mp4 -o reframed.mp4 --max-accuracy
 
   # Custom settings
   ball-reframe -i input.mp4 -o output.mp4 --model yolov8s.pt --device mps --smooth 15 --imgsz 960
@@ -217,11 +236,42 @@ Examples:
                     args.tileOverlap = parseInt(next());
                     break;
                 case "--max-accuracy":
+                case "--ultra-quality":
                     args.maxAccuracy = true;
                     break;
                 case "-h":
                 case "--help":
                     args.help = true;
+                    break;
+                case "--edge-aware":
+                    args.edgeAware = true;
+                    break;
+                case "--ball-comfort-zone":
+                    args.ballComfortZone = parseInt(next());
+                    break;
+                case "--use-ball-memory":
+                    args.useBallMemory = true;
+                    break;
+                case "--no-ball-memory":
+                    args.useBallMemory = false;
+                    break;
+                case "--memory-duration":
+                    args.memoryDurationFrames = parseInt(next());
+                    break;
+                case "--memory-decay":
+                    args.memoryConfidenceDecay = parseFloat(next());
+                    break;
+                case "--memory-blend":
+                    args.memoryBlendFrames = parseInt(next());
+                    break;
+                case "--freeze-on-exit":
+                    args.freezeOnExit = true;
+                    break;
+                case "--freeze-threshold":
+                    args.freezeThreshold = parseInt(next());
+                    break;
+                case "--exit-prediction":
+                    args.exitPrediction = true;
                     break;
                 default:
                     console.warn(`Unknown arg: ${a}`);
@@ -253,20 +303,19 @@ class PythonRunner {
         }
         if (args.maxAccuracy) {
             args.model = args.model || "yolov8x.pt";
-            args.imgsz = args.imgsz ?? 1536;
+            args.imgsz = args.imgsz ?? 1280;
             args.conf = args.conf ?? 0.12;
-            args.useFfmpeg = args.useFfmpeg ?? true;
-            args.profile = args.profile ?? true;
+            args.smooth = args.smooth ?? 19;
             args.threePass = true;
             args.fullDetect = true;
-            args.detectEveryFrame = true;
-            args.strictCenter = true;
-            args.smooth = args.smooth ?? 17;
             args.tiledDetect = true;
-            args.tileSize = args.tileSize ?? 512;
-            args.tileOverlap = args.tileOverlap ?? 128;
+            args.enhancedBootstrap = true;
+            args.multiRoiDetect = true;
+            args.detectionConfidenceBoost = args.detectionConfidenceBoost ?? 1.3;
+            args.stabilityFrames = args.stabilityFrames ?? 7;
             args.backend = args.backend || "yolo-bytetrack";
-            args.noTtaRecovery = args.noTtaRecovery ?? false;
+            args.useFfmpeg = args.useFfmpeg ?? true;
+            args.profile = args.profile ?? true;
         }
         else if (args.fast) {
             args.model = args.model || "yolov8n.pt";
@@ -371,6 +420,16 @@ class PythonRunner {
             pyArgs.push("--tile-size", String(args.tileSize));
         if (args.tileOverlap !== undefined)
             pyArgs.push("--tile-overlap", String(args.tileOverlap));
+        if (args.enhancedBootstrap)
+            pyArgs.push("--enhanced-bootstrap");
+        if (args.detectionConfidenceBoost !== undefined)
+            pyArgs.push("--detection-confidence-boost", String(args.detectionConfidenceBoost));
+        if (args.stabilityFrames !== undefined)
+            pyArgs.push("--stability-frames", String(args.stabilityFrames));
+        if (args.predictionLookahead !== undefined)
+            pyArgs.push("--prediction-lookahead", String(args.predictionLookahead));
+        if (args.multiRoiDetect)
+            pyArgs.push("--multi-roi-detect");
         return pyArgs;
     }
 }

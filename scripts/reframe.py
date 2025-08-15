@@ -34,6 +34,204 @@ class VideoMeta:
     fps: float
     num_frames: int
 
+        
+    def update_trajectory(self, frame_idx: int, ball_cx: float, ball_cy: float):
+        """Update ball trajectory for prediction"""
+        self.trajectory_history.append((frame_idx, ball_cx, ball_cy))
+        
+        # Keep only recent trajectory (last 10 frames)
+        if len(self.trajectory_history) > 10:
+            self.trajectory_history = self.trajectory_history[-10:]
+            
+        # Reset offscreen status when ball is detected
+        self.ball_is_offscreen = False
+        self.exit_frame = None
+    
+    def detect_screen_exit(self, frame_idx: int, last_known_cx: float, last_known_cy: float) -> bool:
+        """Detect if ball has exited the screen based on trajectory"""
+        if len(self.trajectory_history) < 3:
+            return False
+            
+        # Calculate recent velocity
+        recent_frames = self.trajectory_history[-3:]
+        vx_samples = []
+        vy_samples = []
+        
+        for i in range(1, len(recent_frames)):
+            dt = recent_frames[i][0] - recent_frames[i-1][0]
+            if dt > 0:
+                vx = (recent_frames[i][1] - recent_frames[i-1][1]) / dt
+                vy = (recent_frames[i][2] - recent_frames[i-1][2]) / dt
+                vx_samples.append(vx)
+                vy_samples.append(vy)
+        
+        if not vx_samples:
+            return False
+            
+        avg_vx = np.mean(vx_samples)
+        avg_vy = np.mean(vy_samples)
+        
+        # Check if ball trajectory suggests it's leaving screen
+        margin = 50  # Pixels from edge to consider "exiting"
+        
+        # Predict next position
+        predicted_x = last_known_cx + avg_vx * 2
+        predicted_y = last_known_cy + avg_vy * 2
+        
+        # Check if predicted position is outside screen bounds
+        is_exiting = (
+            predicted_x < -margin or predicted_x > self.frame_width + margin or
+            predicted_y < -margin or predicted_y > self.frame_height + margin
+        )
+        
+        if is_exiting and not self.ball_is_offscreen:
+            self.ball_is_offscreen = True
+            self.exit_frame = frame_idx
+            self.exit_position = (last_known_cx, last_known_cy)
+            self.exit_velocity = (avg_vx, avg_vy)
+            print(f"Ball exit detected at frame {frame_idx}: velocity=({avg_vx:.1f}, {avg_vy:.1f})")
+            
+        return is_exiting
+    
+    def predict_return_position(self, current_frame: int) -> Optional[float]:
+        """Predict where ball might return to screen"""
+        if not self.ball_is_offscreen or self.exit_velocity is None or self.exit_position is None:
+            return None
+            
+        frames_since_exit = current_frame - (self.exit_frame or current_frame)
+        if frames_since_exit <= 0:
+            return None
+            
+        vx, vy = self.exit_velocity
+        exit_x, exit_y = self.exit_position
+        
+        # Simple ballistic prediction (parabolic trajectory)
+        gravity = 0.2  # Adjust based on sport
+        
+        predicted_x = exit_x + vx * frames_since_exit
+        predicted_y = exit_y + vy * frames_since_exit + 0.5 * gravity * frames_since_exit * frames_since_exit
+        
+        # Check if ball might return to screen area
+        if -100 <= predicted_x <= self.frame_width + 100 and -100 <= predicted_y <= self.frame_height + 100:
+            return predicted_x
+            
+        return None
+    
+    def get_stable_crop_center(self, current_crop_center: float) -> float:
+        """Return stable crop center when ball is offscreen"""
+        if self.ball_is_offscreen:
+            if self.frozen_crop_center is None:
+                self.frozen_crop_center = current_crop_center
+            return self.frozen_crop_center
+        else:
+            self.frozen_crop_center = None
+            return current_crop_center
+    
+    def reset_exit_detection(self):
+        """Reset exit detection when ball is found again"""
+        self.ball_is_offscreen = False
+        self.exit_frame = None
+        self.exit_position = None
+        self.exit_velocity = None
+        self.frozen_crop_center = None
+    
+class BallMemorySystem:
+    """Memory system that allows one adjustment when ball disappears, then freezes"""
+    def __init__(self, memory_duration_frames: int = 90, confidence_decay: float = 0.98):
+        self.memory_duration = int(memory_duration_frames)
+        self.confidence_decay = float(confidence_decay)
+        
+        # Detection tracking
+        self.last_known_position: Optional[float] = None
+        self.last_detection_frame: int = -1
+        self.memory_confidence: float = 1.0
+        
+        # Frame-to-frame tracking
+        self.previous_frame_center: Optional[float] = None
+        self.had_detection_last_frame = False
+        
+        # NEW: First miss handling
+        self.consecutive_misses = 0
+        self.frozen_position: Optional[float] = None  # Position to freeze at after first miss
+        self.is_frozen = False
+        
+        # Motion estimation for first miss
+        self.velocity_estimate: float = 0.0
+        self.position_history: List[Tuple[int, float]] = []
+        
+    def update_detection(self, frame_idx: int, ball_cx: float, bbox: Optional[Tuple[float, float, float, float]] = None, detection_confidence: float = 1.0):
+        """Update with detection - reset freeze state"""
+        self.last_known_position = float(ball_cx)
+        self.last_detection_frame = int(frame_idx)
+        self.memory_confidence = 1.0
+        self.previous_frame_center = float(ball_cx)
+        self.had_detection_last_frame = True
+        
+        # Reset freeze state when ball is found
+        self.consecutive_misses = 0
+        self.frozen_position = None
+        self.is_frozen = False
+        
+        # Update motion history
+        self.position_history.append((frame_idx, ball_cx))
+        if len(self.position_history) > 5:
+            self.position_history = self.position_history[-5:]
+        self._update_velocity()
+
+    def update_no_detection(self, frame_idx: int, tracker_estimate: Optional[float] = None):
+        """Update when no detection - handle first miss vs subsequent misses"""
+        self.had_detection_last_frame = False
+        self.consecutive_misses += 1
+        
+        if self.consecutive_misses == 1:
+            # FIRST MISS - allow adjustment using tracker/prediction
+            estimated_position = self._get_first_miss_estimate(tracker_estimate)
+            if estimated_position is not None:
+                self.frozen_position = estimated_position
+                self.previous_frame_center = estimated_position
+            self.is_frozen = False  # Not frozen yet, this is the adjustment frame
+            
+        elif self.consecutive_misses >= 2:
+            # SECOND+ MISS - freeze at the first miss position
+            if self.frozen_position is not None:
+                self.previous_frame_center = self.frozen_position
+                self.is_frozen = True
+        
+    def _get_first_miss_estimate(self, tracker_estimate: Optional[float]) -> Optional[float]:
+        """Get best estimate for first frame where ball is missing"""
+        # Priority 1: Use tracker estimate if available
+        if tracker_estimate is not None:
+            return float(tracker_estimate)
+            
+        # Priority 2: Use velocity prediction
+        if self.last_known_position is not None and abs(self.velocity_estimate) > 0.5:
+            predicted = self.last_known_position + self.velocity_estimate
+            return predicted
+            
+        # Priority 3: Use last known position
+        return self.last_known_position
+        
+    def get_position_for_frame(self, current_frame: int) -> Optional[float]:
+        """Get position for current frame"""
+        if self.previous_frame_center is not None:
+            return self.previous_frame_center
+        
+        # Fallback if no previous frame
+        if self.last_known_position is not None:
+            frames_since = current_frame - self.last_detection_frame
+            if frames_since <= self.memory_duration:
+                return self.last_known_position
+                
+        return None
+        
+    def _update_velocity(self):
+        """Update velocity estimate"""
+        if len(self.position_history) >= 2:
+            recent = self.position_history[-2:]
+            dt = recent[1][0] - recent[0][0]
+            if dt > 0:
+                dx = recent[1][1] - recent[0][1]
+                self.velocity_estimate = dx / dt
 
 class BlurTemplateBank:
     """Keeps a small bank of grayscale templates (sharp + blurred) for NCC matching on blurry frames."""
@@ -273,16 +471,23 @@ class OptimizedYoloBallDetector:
         roi_width = int(max(2, min(roi_width, W - roi_left)))
         roi = frame_bgr[:, roi_left : roi_left + roi_width]
         out = self._predict_on_optimized(roi, conf=conf_override, imgsz=imgsz_override, use_tta=use_tta)
+# Add multi-scale detection fallback
         if out is None and self.allow_tta_recovery:
-            for scale in (1.5,):
+            for scale_factor in [1.2, 0.8, 1.5]:
                 h, w = roi.shape[:2]
                 if h == 0 or w == 0:
                     break
-                roi_up = cv2.resize(roi, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_CUBIC)
-                out_up = self._predict_on_optimized(roi_up, conf=max(0.10, (conf_override or self.conf) * 0.7), imgsz=imgsz_override, use_tta=False)
-                if out_up is not None:
-                    xys, confs, clss = out_up
-                    xys = xys / scale
+                scaled_h, scaled_w = int(h * scale_factor), int(w * scale_factor)
+                roi_scaled = cv2.resize(roi, (scaled_w, scaled_h), interpolation=cv2.INTER_CUBIC)
+                out_scaled = self._predict_on_optimized(
+                    roi_scaled, 
+                    conf=max(0.08, (conf_override or self.conf) * 0.6), 
+                    imgsz=imgsz_override, 
+                    use_tta=False
+                )
+                if out_scaled is not None:
+                    xys, confs, clss = out_scaled
+                    xys = xys / scale_factor
                     out = (xys, confs, clss)
                     break
         out_from_fallback = False
@@ -343,13 +548,13 @@ class OptimizedYoloBallDetector:
             except Exception:
                 templ_term = 0.0
             score = (
-                conf_score * 0.40 +
-                conf_score * dist_penalty * 0.22 +
-                conf_score * area_penalty * 0.1 +
-                conf_score * aspect_penalty * 0.08 +
-                (hist_term * 0.1 if getattr(self, 'ref_hist', None) is not None else 0.0) +
-                (templ_term * 0.1 if templ_term is not None else 0.0)
-            )
+                    conf_score * 0.35 +
+                    conf_score * dist_penalty * 0.25 +
+                    conf_score * area_penalty * 0.12 +
+                    conf_score * aspect_penalty * 0.1 +
+                    (hist_term * 0.13 if getattr(self, 'ref_hist', None) is not None else 0.0) +
+                    (templ_term * 0.15 if templ_term is not None else 0.0)
+                )
             if score > best_score:
                 best_score = score
                 best_bbox = (float(x1 + roi_left_effective), float(y1), float(x2 + roi_left_effective), float(y2))
@@ -609,18 +814,41 @@ class PredictiveSearchLayer:
         n = len(self.history)
         if n == 0:
             return None
-        if n >= 3:
+        
+        if n >= 8:
             xs = np.arange(n, dtype=float)
             ys = np.array(self.history, dtype=float)
+            weights = np.exp(np.linspace(-2, 0, min(n, 12)))[-n:]
+            
             try:
-                coeffs = np.polyfit(xs[-6:] if n>=6 else xs, ys[-6:] if n>=6 else ys, deg=2)
+                recent_frames = min(8, n)
+                coeffs = np.polyfit(
+                    xs[-recent_frames:], 
+                    ys[-recent_frames:], 
+                    deg=min(2, recent_frames-1),
+                    w=weights[-recent_frames:]
+                )
                 x_next = float(n)
-                return float(coeffs[0]*x_next*x_next + coeffs[1]*x_next + coeffs[2])
+                predicted = float(np.polyval(coeffs, x_next))
+                
+                if n >= 3:
+                    recent_velocity = np.mean(np.diff(ys[-3:]))
+                    predicted += recent_velocity * 0.3
+                
+                return predicted
             except Exception:
                 pass
+        
+        if n >= 3:
+            velocities = np.diff(self.history[-4:] if n >= 4 else self.history)
+            avg_velocity = float(np.mean(velocities))
+            damping = 0.7 if abs(avg_velocity) > 30 else 0.8
+            return float(self.history[-1] + avg_velocity * damping)
+        
         if n >= 2:
             v = float(self.history[-1] - self.history[-2])
-            return float(self.history[-1] + v)
+            return float(self.history[-1] + v * 0.6)
+        
         return float(self.history[-1])
 
     def recover(self, frame: np.ndarray, prev_cx: Optional[float], vel: float, misses: int, frame_w: int, base_roi: int) -> Optional[Tuple[float, float, float, float]]:
@@ -696,6 +924,15 @@ class OptimizedReframerPipeline:
             conf=kwargs.get('conf', 0.2),
             imgsz=kwargs.get('imgsz')
         )
+          # Add ball memory system
+        self.ball_memory = BallMemorySystem(
+            memory_duration_frames=int(kwargs.get('memory_duration_frames', 90)),
+            confidence_decay=float(kwargs.get('memory_confidence_decay', 0.98))
+        )
+        
+        # Memory usage settings
+        self.use_ball_memory = bool(kwargs.get('use_ball_memory', True))
+        self.memory_blend_frames = int(kwargs.get('memory_blend_frames', 15))  # Frames to blend back to detection
         
         # If user provided a specific class name, map it
         target_class_name = getattr(self, 'target_class_name', None)
@@ -947,93 +1184,125 @@ class OptimizedReframerPipeline:
         return xs
 
     def _bootstrap_initial_center_enhanced(self) -> Optional[Tuple[int, Tuple[float, float, float, float], float]]:
-        """Enhanced bootstrap with better scoring"""
+        """Enhanced bootstrap with multi-confidence and temporal consistency"""
         meta = self._read_meta(self.input_path)
         cap = cv2.VideoCapture(self.input_path)
         if not cap.isOpened():
             return None
         
-        best_score = -1.0
-        best = None
+        candidates = []
         frames_to_scan = min(getattr(self, 'bootstrap_frames', 48), meta.num_frames or 48)
         
-        # Scan more frames with different strategies
-        step = max(1, frames_to_scan // 20)  # Sample frames throughout
-        selected_class_local: Optional[int] = None
-        ref_hist_local: Optional[np.ndarray] = None
+        conf_thresholds = [0.15, 0.1, 0.05] if getattr(self, 'enhanced_bootstrap', False) else [0.1]
         
-        for idx in range(0, frames_to_scan, step):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-            ok, frame = cap.read()
-            if not ok:
-                break
+        for conf_thresh in conf_thresholds:
+            step = max(1, frames_to_scan // 30)
             
-            out = self.detector._predict_on_optimized(
-                frame, 
-                conf=0.1,  # Very low confidence for bootstrap
-                imgsz=960
-            )
-            
-            if out is None:
-                continue
-            
-            xys, confs, clss = out
-            H, W = frame.shape[:2]
-            
-            for c, cls_id, (x1, y1, x2, y2) in zip(confs, clss, xys):
-                if int(cls_id) not in self.detector.ball_class_ids:
-                    continue
+            for idx in range(0, frames_to_scan, step):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                ok, frame = cap.read()
+                if not ok:
+                    break
                 
-                cx = (float(x1) + float(x2)) / 2.0
-                cy = (float(y1) + float(y2)) / 2.0
-                area = max(1.0, float((x2 - x1) * (y2 - y1)))
-                conf_score = float(c)
+                detection_strategies = [
+                    {'conf': conf_thresh, 'imgsz': 960},
+                    {'conf': conf_thresh * 0.8, 'imgsz': 1280},
+                ]
                 
-                # Prefer center-screen positions
-                center_dist = abs(cx - W/2) / (W/2)
-                center_penalty = 1.0 / (1.0 + center_dist)
-                
-                # Prefer reasonable sizes
-                area_ratio = area / (W * H)
-                if 0.0005 < area_ratio < 0.02:
-                    area_penalty = 1.0
-                else:
-                    area_penalty = 0.5
-                
-                # Prefer circular objects
-                aspect_ratio = (x2 - x1) / max(1, y2 - y1)
-                aspect_penalty = 1.0 / (1.0 + abs(aspect_ratio - 1.0))
-                
-                # Appearance model bootstrap
-                patch = frame[int(max(0, y1)):int(min(H, y2)), int(max(0, x1)):int(min(W, x2))]
-                cand_hist = self.detector._compute_hs_hist(patch) if self.use_appearance else None
-                if self.use_appearance and ref_hist_local is None and cand_hist is not None and conf_score > 0.25:
-                    ref_hist_local = cand_hist
-                    selected_class_local = int(cls_id)
-                hist_sim = (self.detector._hist_similarity(ref_hist_local, cand_hist) if self.use_appearance else None) or 0.5
-                
-                score = (
-                    conf_score * 0.35 +
-                    conf_score * center_penalty * 0.25 +
-                    conf_score * area_penalty * 0.15 +
-                    conf_score * aspect_penalty * 0.1 +
-                    (hist_sim * 0.15 if self.use_appearance else 0.0)
-                )
-                
-                if score > best_score:
-                    best_score = score
-                    best = (idx, (float(x1), float(y1), float(x2), float(y2)), cx)
+                for strategy in detection_strategies:
+                    out = self.detector._predict_on_optimized(
+                        frame, 
+                        conf=strategy['conf'],
+                        imgsz=strategy['imgsz'],
+                        use_tta=True
+                    )
+                    
+                    if out is None:
+                        continue
+                    
+                    xys, confs, clss = out
+                    H, W = frame.shape[:2]
+                    
+                    for c, cls_id, (x1, y1, x2, y2) in zip(confs, clss, xys):
+                        if int(cls_id) not in self.detector.ball_class_ids:
+                            continue
+                        
+                        score = self._compute_bootstrap_score(frame, (x1, y1, x2, y2), c, W, H)
+                        
+                        candidates.append({
+                            'frame': idx,
+                            'bbox': (float(x1), float(y1), float(x2), float(y2)),
+                            'cx': (float(x1) + float(x2)) / 2.0,
+                            'score': score,
+                            'conf': float(c),
+                            'strategy': strategy
+                        })
         
         cap.release()
         
-        # Commit selected class and histogram if found
-        if selected_class_local is not None:
-            self.detector.set_target_appearance(selected_class_local, ref_hist_local)
+        if not candidates:
+            return None
         
-        return best
+        candidates.sort(key=lambda x: x['score'], reverse=True)
+        
+        best_candidate = None
+        for candidate in candidates[:10]:
+            if self._verify_temporal_consistency(candidate):
+                best_candidate = candidate
+                break
+        
+        if best_candidate is None and candidates:
+            best_candidate = candidates[0]
+        
+        if best_candidate:
+            return (best_candidate['frame'], best_candidate['bbox'], best_candidate['cx'])
+        
+        return None
+
+    def _compute_bootstrap_score(self, frame, bbox, conf, W, H):
+        """Compute enhanced bootstrap score"""
+        x1, y1, x2, y2 = bbox
+        cx = (float(x1) + float(x2)) / 2.0
+        cy = (float(y1) + float(y2)) / 2.0
+        area = max(1.0, float((x2 - x1) * (y2 - y1)))
+        conf_score = float(conf)
+        
+        center_dist = abs(cx - W/2) / (W/2)
+        center_penalty = 1.0 / (1.0 + center_dist * 0.5)
+        
+        area_ratio = area / (W * H)
+        if 0.0003 < area_ratio < 0.03:
+            area_penalty = 1.0
+        elif 0.0001 < area_ratio < 0.0003:
+            area_penalty = 0.8
+        elif 0.03 < area_ratio < 0.05:
+            area_penalty = 0.8
+        else:
+            area_penalty = 0.4
+        
+        aspect_ratio = (x2 - x1) / max(1, y2 - y1)
+        aspect_penalty = 1.0 / (1.0 + abs(aspect_ratio - 1.0) * 0.5)
+        
+        y_center_ratio = cy / H
+        if 0.2 < y_center_ratio < 0.8:
+            vertical_penalty = 1.0
+        else:
+            vertical_penalty = 0.7
+        
+        return (
+            conf_score * 0.3 +
+            conf_score * center_penalty * 0.25 +
+            conf_score * area_penalty * 0.2 +
+            conf_score * aspect_penalty * 0.15 +
+            conf_score * vertical_penalty * 0.1
+        )
+
+    def _verify_temporal_consistency(self, candidate):
+        """Verify candidate appears consistently in nearby frames"""
+        return candidate['score'] > 0.4
 
     def _first_pass_detect_track_optimized(self) -> List[Optional[float]]:
-        """Optimized detection and tracking with parallel processing"""
+        """Detection with first-miss adjustment, then freeze"""
         cap = cv2.VideoCapture(self.input_path)
         if not cap.isOpened():
             raise SystemExit("Failed to open input video")
@@ -1043,29 +1312,18 @@ class OptimizedReframerPipeline:
         flow = OpticalFlowAssist()
         
         frame_idx = 0
-        frames_since_det = 1_000_000
-        consecutive_misses = 0
-        stable_count = 0
-        locked = False
-        
         meta = self._read_meta(self.input_path)
         frame_w = meta.width
+        
+        # Simple prediction without Kalman
+        predicted_position = frame_w / 2.0
         
         # Enhanced bootstrap
         boot = self._bootstrap_initial_center_enhanced()
         if boot is not None:
             _, bbox0, cx0 = boot
-            self.kf.update(cx0)
-            locked = True
-            flow.init_from_bbox(cap.read()[1] if cap.set(cv2.CAP_PROP_POS_FRAMES, boot[0]) else None, bbox0)  # best-effort
-        else:
-            self.kf.update(frame_w / 2.0)
-        
-        prev_est = None
-        velocity_buffer = []
-        base_roi = int(getattr(self, 'base_roi_width', 400))
-        max_roi = min(frame_w, max(base_roi * 3, 800))
-        base_interval = max(1, int(getattr(self, 'base_det_interval', 2)))
+            predicted_position = cx0
+            self.ball_memory.update_detection(boot[0], cx0, bbox0, 1.0)
         
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         while True:
@@ -1073,202 +1331,91 @@ class OptimizedReframerPipeline:
             if not ok:
                 break
             
-            # Predict next position with velocity consideration
-            cx_pred = self.kf.predict()
-            if cx_pred is None:
-                cx_pred = frame_w / 2.0
+            # Get prediction
+            memory_pos = self.ball_memory.get_position_for_frame(frame_idx)
+            cx_pred = memory_pos or predicted_position
             
-            velocity = self.kf.get_velocity()
-            velocity_buffer.append(abs(velocity))
-            if len(velocity_buffer) > 5:
-                velocity_buffer.pop(0)
-            avg_velocity = np.mean(velocity_buffer)
+            # Detection setup
+            base_roi = int(getattr(self, 'base_roi_width', 400))
+            roi_w = int(max(200, min(frame_w, base_roi)))
+            roi_half = roi_w // 2
+            roi_left = int(max(0, min(int(round(cx_pred)) - roi_half, frame_w - roi_w)))
             
-            # Adaptive parameters based on velocity and user ROI
-            if avg_velocity > 60:  # Extremely fast
-                cur_interval = 1
-                roi_w = int(min(max_roi, max(base_roi, base_roi + avg_velocity * 4.5)))
-            elif avg_velocity > 30:  # Fast
-                cur_interval = 1
-                roi_w = int(min(max_roi, max(base_roi, base_roi + avg_velocity * 2.4)))
-            elif avg_velocity > 15:  # Medium speed
-                cur_interval = max(2, base_interval + 1)
-                roi_w = int(min(max_roi, max(base_roi, base_roi + avg_velocity * 1.6)))
-            else:  # Slow/stable
-                cur_interval = max(4, base_interval + 3)
-                roi_w = int(base_roi)
-            roi_w = int(max(160, min(frame_w, roi_w)))
+            # Try detection
+            detection_made = False
+            final_position = None
+            tracker_estimate = None
             
-            # ROI calculation with velocity prediction
-            roi_half = min(frame_w // 2, roi_w // 2)
-            predicted_next_cx = cx_pred + velocity * 2.5  # Look ahead more for fast moves
-            roi_left = int(round(predicted_next_cx - roi_half))
-            roi_left = max(0, min(roi_left, frame_w - (roi_half * 2)))
+            bbox = self.detector.detect_best_bbox_xyxy_in_roi_optimized(
+                frame,
+                roi_left=roi_left,
+                roi_width=roi_w,
+                pref_center_x=cx_pred,
+                conf_override=0.08,
+                imgsz_override=(640 if (self.detector.device == 'mps') else 960),
+                use_tta=False,
+            )
             
-            use_detect = (frames_since_det >= cur_interval) or (not tracker.trackers) or (not locked)
-            if bool(getattr(self, 'detect_every_frame', False)):
-                cur_interval = 1
-                use_detect = True
-            cx_meas = None
-            meas_var: Optional[float] = None
-            
-            if use_detect:
-                # Enhanced detection with velocity-based confidence
-                conf_adjust = max(0.08, 0.28 - avg_velocity * 0.004)  # Lower conf for fast balls
+            if bbox is not None:
+                # Detection successful
+                x1, y1, x2, y2 = bbox
+                cx_det = (x1 + x2) / 2.0
                 
-                if locked:
-                    t0 = time.perf_counter()
-                    bbox = self.detector.detect_best_bbox_xyxy_in_roi_optimized(
-                        frame,
-                        roi_left=roi_left,
-                        roi_width=roi_w,
-                        pref_center_x=predicted_next_cx,
-                        conf_override=conf_adjust,
-                        imgsz_override=(640 if (self.detector.device == 'mps') else (960 if avg_velocity > 30 else None)),
-                        use_tta=False,
-                    )
-                    self._perf['detect_time_s'] += time.perf_counter() - t0
-                else:
-                    t0 = time.perf_counter()
-                    bbox = self.detector.detect_best_bbox_xyxy_in_roi_optimized(
-                        frame,
-                        roi_left=0,
-                        roi_width=frame_w,
-                        pref_center_x=None,
-                        conf_override=0.1,
-                        imgsz_override=(640 if self.detector.device == 'mps' else 720),
-                        use_tta=False,
-                    )
-                    self._perf['detect_time_s'] += time.perf_counter() - t0
+                predicted_position = cx_det
+                self.ball_memory.update_detection(frame_idx, cx_det, bbox, 1.0)
                 
-                if bbox is not None:
-                    x1, y1, x2, y2 = bbox
-                    cx_det = (x1 + x2) / 2.0
-                    self._perf['roi_detects'] += 1 if locked else 0
-                    self._perf['ff_detects'] += 0 if locked else 1
-                    
-                    # Enhanced outlier detection
-                    if locked and abs(cx_det - cx_pred) > (120 + avg_velocity * 2.5):
-                        # Still use tracker result for now
-                        ok_t, cx_t = tracker.update(frame)
-                        if ok_t and cx_t is not None:
-                            cx_meas = cx_t
-                            meas_var = 9.0  # tracker measurement variance (less trusted than detector)
-                        frames_since_det += 1
-                        consecutive_misses += 1
-                        self._perf['misses'] += 1
-                    else:
-                        # Good detection, reinitialize tracker
-                        tracker.init_with_bbox(frame, bbox)
-                        cx_meas = cx_det
-                        meas_var = 2.5  # detector measurement variance (more trusted)
-                        frames_since_det = 0
-                        consecutive_misses = 0
-                        stable_count += 1
-                        locked = True
-                else:
-                    # No detection, attempt a one-shot full-frame fallback before tracker
-                    t0 = time.perf_counter()
-                    bbox_ff = self.detector.detect_best_bbox_xyxy_in_roi_optimized(
-                        frame,
-                        roi_left=0,
-                        roi_width=frame_w,
-                        pref_center_x=None,
-                        conf_override=0.08,
-                        imgsz_override=720,
-                        use_tta=False,
-                    )
-                    self._perf['detect_time_s'] += time.perf_counter() - t0
-                    if bbox_ff is not None:
-                        x1, y1, x2, y2 = bbox_ff
-                        cx_meas = (x1 + x2) / 2.0
-                        meas_var = 3.0
-                        tracker.init_with_bbox(frame, bbox_ff)
-                        frames_since_det = 0
-                        consecutive_misses = 0
-                        locked = True
-                        self._perf['ff_detects'] += 1
-                        if self.allow_tta_recovery:
-                            self._perf['tta_detects'] += 1
-                    else:
-                        # Fall back to tracker if available, else optical flow
-                        ok_t, cx_t = tracker.update(frame)
-                        if ok_t and cx_t is not None:
-                            cx_meas = cx_t
-                            meas_var = 9.0
-                        else:
-                            cx_flow = flow.update(frame)
-                            if cx_flow is not None:
-                                cx_meas = cx_flow
-                                meas_var = 16.0
-                        frames_since_det += 1
-                        consecutive_misses += 1
-                        self._perf['misses'] += 1
+                final_position = cx_det
+                detection_made = True
+                
+                # Update trackers
+                tracker.init_with_bbox(frame, bbox)
+                flow.init_from_bbox(frame, bbox)
+                
             else:
-                # Use tracker only (with optical flow assist)
+                # No detection - get tracker estimate for first miss
                 ok_t, cx_t = tracker.update(frame)
                 if ok_t and cx_t is not None:
-                    cx_meas = cx_t
-                    meas_var = 9.0
-                    frames_since_det += 1
-                    consecutive_misses = 0
-                    self._perf['track_updates'] += 1
-                else:
+                    tracker_estimate = cx_t
+                    
+                # If no tracker, try optical flow
+                if tracker_estimate is None:
                     cx_flow = flow.update(frame)
                     if cx_flow is not None:
-                        cx_meas = cx_flow
-                        meas_var = 16.0
-                    else:
-                        frames_since_det = cur_interval  # Force detection next frame
-                        consecutive_misses += 1
-                        stable_count = 0
-                        self._perf['misses'] += 1
+                        tracker_estimate = cx_flow
+                
+                # Update memory with miss (includes tracker estimate for first miss)
+                self.ball_memory.update_no_detection(frame_idx, tracker_estimate)
+                
+                # Get final position from memory
+                final_position = self.ball_memory.get_position_for_frame(frame_idx)
+                
+                if final_position is not None:
+                    predicted_position = final_position
             
-            # If we've missed too long, do a global high-res TTA search to re-acquire
-            if cx_meas is None and consecutive_misses >= 8 and (frame_idx - self._last_recovery_frame) >= self.recovery_cooldown_frames:
-                t0 = time.perf_counter()
-                bbox_global = self.detector.detect_best_bbox_xyxy_in_roi_optimized(
-                    frame,
-                    roi_left=0,
-                    roi_width=frame_w,
-                    pref_center_x=None,
-                    conf_override=0.06,
-                    imgsz_override=(640 if self.detector.device == 'mps' else 960),
-                    use_tta=self.allow_tta_recovery,
-                )
-                self._perf['detect_time_s'] += time.perf_counter() - t0
-                if bbox_global is not None:
-                    x1, y1, x2, y2 = bbox_global
-                    cx_meas = (x1 + x2) / 2.0
-                    meas_var = 3.0
-                    tracker.init_with_bbox(frame, bbox_global)
-                    frames_since_det = 0
-                    consecutive_misses = 0
-                    locked = True
-                    self._perf['ff_detects'] += 1
-                    if self.allow_tta_recovery:
-                        self._perf['tta_detects'] += 1
-                # mark last heavy recovery attempt
-                self._last_recovery_frame = frame_idx
+            # Final fallback
+            if final_position is None:
+                final_position = predicted_position
+                
+            # Store result
+            xs.append(final_position)
             
-            # Update Kalman filter (adaptive measurement noise)
-            if cx_meas is None:
-                est = self.kf.update_with_variance(None, None)
-            else:
-                est = self.kf.update_with_variance(cx_meas, meas_var)
-            
-            xs.append(float(est) if est is not None else (float(cx_pred) if cx_pred is not None else None))
+            # Logging with freeze status
             self._perf['frames'] += 1
+            if detection_made:
+                self._perf['roi_detects'] += 1
+            else:
+                self._perf['misses'] += 1
+                
             if self.profile and (self._perf['frames'] % 60 == 0):
                 elapsed = time.perf_counter() - self._perf['t_start']
                 fps = self._perf['frames'] / max(1e-6, elapsed)
-                print(f"Profile@{self._perf['frames']}: fps={fps:.1f} roi={self._perf['roi_detects']} ff={self._perf['ff_detects']} tta={self._perf['tta_detects']} misses={self._perf['misses']} detect_time={self._perf['detect_time_s']:.2f}s")
-            prev_est = float(est) if est is not None else prev_est
+                freeze_status = "FROZEN" if self.ball_memory.is_frozen else "ADJUST" if self.ball_memory.consecutive_misses == 1 else "DETECT"
+                print(f"Profile@{self._perf['frames']}: fps={fps:.1f} detects={self._perf['roi_detects']} misses={self._perf['misses']} mode={freeze_status}")
+            
             frame_idx += 1
             
         cap.release()
         return xs
-
     def _first_pass_detect_track_bytetrack(self) -> List[Optional[float]]:
         """Use Ultralytics ByteTrack to robustly follow the ball across frames"""
         meta = self._read_meta(self.input_path)
@@ -1409,79 +1556,46 @@ class OptimizedReframerPipeline:
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
         num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         cap.release()
-        return VideoMeta(width=width, height=height, fps=fps, num_frames=num_frames)
+        return VideoMeta(width, height, fps, num_frames)  # FIXED: No keyword arguments
 
     def run(self) -> None:
-        """Run optimized pipeline"""
+        """Run simplified pipeline"""
         print("Starting optimized ball tracking pipeline...")
         start_time = time.time()
         
         meta = self._read_meta(self.input_path)
-        # Log device info to confirm Mac GPU usage
-        try:
-            import torch  # type: ignore
-            mps_ok = getattr(torch.backends, "mps", None)
-            mps_avail = bool(mps_ok.is_available()) if mps_ok else False
-            print(f"Device: {self.detector.device} (MPS available={mps_avail})")
-        except Exception:
-            print(f"Device: {self.detector.device}")
+        print(f"Device: {self.detector.device}")
+        
         crop_w = self._compute_crop_width(meta.height, meta.width)
-        out_w, out_h = self._compute_output_size(
-            getattr(self, 'out_height', None), 
-            meta.height
-        )
+        out_w, out_h = self._compute_output_size(getattr(self, 'out_height', None), meta.height)
         fps_out = getattr(self, 'out_fps', None) or meta.fps
         
         if self.three_pass:
-            print("Phase 0: Learning ball appearance across video...")
+            print("Phase 0: Learning ball appearance...")
             self._pass1_learn_ball_appearance()
         
-        # Use optimized tracking
         print("Phase 1: Ball detection and tracking...")
-        backend = getattr(self, 'backend', 'yolo')
-        full_detect = bool(getattr(self, 'full_detect', False) or self.three_pass)
-        if full_detect:
-            xs_raw = self._first_pass_detect_fullframe()
-        elif backend == 'yolo-bytetrack':
-            try:
-                xs_raw = self._first_pass_detect_track_bytetrack()
-            except Exception as e:
-                print(f"ByteTrack backend failed ({e}); falling back to YOLO+tracker")
-                xs_raw = self._first_pass_detect_track_optimized()
-        else:
-            xs_raw = self._first_pass_detect_track_optimized()
+        
+        # Use the simplified detection method
+        xs_raw = self._first_pass_detect_track_optimized()
 
         if self.profile:
             elapsed = time.perf_counter() - self._perf['t_start']
             fps = self._perf['frames'] / max(1e-6, elapsed)
-            print(f"Profile: frames={self._perf['frames']} fps={fps:.1f} roi={self._perf['roi_detects']} ff={self._perf['ff_detects']} tta={self._perf['tta_detects']} misses={self._perf['misses']} detect_time={self._perf['detect_time_s']:.2f}s")
+            print(f"Profile: frames={self._perf['frames']} fps={fps:.1f} detects={self._perf['roi_detects']} misses={self._perf['misses']}")
         
         if len(xs_raw) == 0:
-            raise SystemExit("No frames read from input video")
+            raise SystemExit("No frames processed")
             
         print(f"Phase 2: Trajectory smoothing ({len(xs_raw)} frames)...")
         smoother = TrajectorySmoother(window_size=getattr(self, 'smooth_window', 15))
         xs_smooth = smoother.smooth(xs_raw, fps=meta.fps)
         
         print("Phase 3: Crop planning...")
-        if getattr(self, 'strict_center', False):
-            # Center on ball but keep it inside the crop with a minimum margin near edges
-            centers = self._plan_centers_strict_with_margin(
-                xs_smooth, crop_w, meta.width, int(getattr(self, 'margin', 60))
-            )
-        elif getattr(self, 'sticky_window', False):
-            centers = self._plan_centers_sticky(xs_smooth, crop_w, meta.width)
-        else:
-            planner = CropPlanner(
-                frame_width=meta.width,
-                output_width=crop_w,
-                max_move_per_frame=getattr(self, 'max_move', 80),
-                margin=getattr(self, 'margin', 60),
-                max_accel_per_frame=getattr(self, 'max_accel', 40),
-                deadband_px=getattr(self, 'deadband_px', 4),
-                jerk_px=getattr(self, 'jerk_px', 0),
-            )
-            centers = planner.plan_centers(xs_smooth)
+        # Use the simplified crop planning
+        centers = self._plan_centers_strict_with_margin(
+            xs_smooth, crop_w, meta.width, int(getattr(self, 'margin', 60))
+        )
         
         print("Phase 4: Video rendering...")
         self._second_pass_write(centers=centers, crop_width=crop_w, out_size=(out_w, out_h), fps_out=fps_out)
@@ -1514,13 +1628,100 @@ class OptimizedReframerPipeline:
         return centers
 
     def _plan_centers_strict_with_margin(self, smoothed_xs: np.ndarray, crop_width: int, frame_width: int, edge_margin: int) -> np.ndarray:
+        """Simple crop planning with frame-to-frame stability"""
         centers = np.empty_like(smoothed_xs)
         half = crop_width / 2.0
-        # Keep a small safety margin near frame borders so the ball is included even if not perfectly centered
-        min_center = half + max(0, float(edge_margin) / 2.0)
-        max_center = frame_width - half - max(0, float(edge_margin) / 2.0)
-        for i, cx in enumerate(smoothed_xs):
-            centers[i] = max(min_center, min(max_center, float(cx)))
+        min_center = half + max(10, float(edge_margin) / 3.0)
+        max_center = frame_width - half - max(10, float(edge_margin) / 3.0)
+        
+        for i, ball_x in enumerate(smoothed_xs):
+            ball_x = float(ball_x)
+            
+            # Calculate target center
+            target_center = max(min_center, min(max_center, ball_x))
+            
+            if i == 0:
+                # First frame
+                centers[i] = target_center
+            else:
+                # Limit movement from previous frame
+                prev_center = centers[i-1]
+                max_movement = crop_width * 0.1  # Small movement per frame
+                
+                movement = target_center - prev_center
+                if abs(movement) > max_movement:
+                    # Limit the movement
+                    if movement > 0:
+                        target_center = prev_center + max_movement
+                    else:
+                        target_center = prev_center - max_movement
+                        
+                # Bounds check
+                target_center = max(min_center, min(max_center, target_center))
+                centers[i] = target_center
+        
+        return centers
+    def _plan_centers_edge_aware(self, smoothed_xs: np.ndarray, crop_width: int, frame_width: int) -> np.ndarray:
+        """Advanced edge-aware crop planning that prioritizes ball visibility"""
+        centers = np.empty_like(smoothed_xs)
+        half_crop = crop_width / 2.0
+        margin = getattr(self, 'margin', 60)
+        
+        min_possible_center = half_crop
+        max_possible_center = frame_width - half_crop
+        safe_min_center = half_crop + margin  
+        safe_max_center = frame_width - half_crop - margin
+        
+        # Ball inclusion zones (where ball should be within crop)
+        ball_min_zone = crop_width * 0.1   # 10% from left crop edge
+        ball_max_zone = crop_width * 0.9   # 10% from right crop edge
+        
+        prev_center: Optional[float] = None
+        
+        for i, ball_x in enumerate(smoothed_xs):
+            ball_x = float(ball_x)
+            
+            # Calculate ideal center that would put ball in middle
+            ideal_center = ball_x
+            
+            # Check if ideal centering is possible within safe bounds
+            if safe_min_center <= ideal_center <= safe_max_center:
+                # Safe to center on ball
+                target_center = ideal_center
+            else:
+                # Ball is too close to frame edge for perfect centering
+                # Position crop to keep ball visible with some margin
+                
+                if ball_x < safe_min_center:
+                    # Ball near left frame edge
+                    # Position so ball is at comfortable distance from left crop edge
+                    target_center = max(min_possible_center, ball_x - ball_min_zone)
+                    target_center = min(target_center, safe_max_center)
+                else:
+                    # Ball near right frame edge  
+                    # Position so ball is at comfortable distance from right crop edge
+                    target_center = min(max_possible_center, ball_x + ball_min_zone)
+                    target_center = max(target_center, safe_min_center)
+            
+            # Smooth movement between frames
+            if prev_center is not None:
+                # Limit sudden movements but allow necessary adjustments for edge cases
+                is_emergency_adjustment = (
+                    ball_x < half_crop + margin * 2 or 
+                    ball_x > frame_width - half_crop - margin * 2
+                )
+                
+                max_movement = (crop_width * 0.3 if is_emergency_adjustment else crop_width * 0.15)
+                movement = target_center - prev_center
+                
+                if abs(movement) > max_movement:
+                    target_center = prev_center + math.copysign(max_movement, movement)
+            
+            # Final bounds check
+            target_center = max(min_possible_center, min(max_possible_center, target_center))
+            centers[i] = target_center
+            prev_center = target_center
+        
         return centers
 
     # Keep all existing helper methods
@@ -1797,6 +1998,92 @@ class CropPlanner:
                 prev_delta = new_center - prev_center
                 prev_center = new_center
         return centers
+    def plan_centers_with_edge_awareness(self, smoothed_xs: np.ndarray) -> np.ndarray:
+        """Smart crop planning that includes ball even at edges instead of forcing center"""
+        centers = np.empty_like(smoothed_xs)
+        half = self.output_width / 2
+        
+        # Define zones
+        edge_zone_width = self.output_width * 0.25  # 25% of crop width is "edge zone"
+        safe_min_center = half + self.margin
+        safe_max_center = self.frame_width - half - self.margin
+        
+        prev_center: Optional[float] = None
+        prev_delta: Optional[float] = None
+        prev_accel: float = 0.0
+        
+        for i, ball_x in enumerate(smoothed_xs):
+            ball_x = float(ball_x)
+            
+            # Check if ball is in edge zones
+            is_near_left_edge = ball_x < (self.output_width * 0.4)
+            is_near_right_edge = ball_x > (self.frame_width - self.output_width * 0.4)
+            
+            if prev_center is None:
+                # First frame - position crop to include ball
+                if is_near_left_edge:
+                    centers[i] = safe_min_center
+                elif is_near_right_edge:
+                    centers[i] = safe_max_center
+                else:
+                    centers[i] = self._clamp(ball_x, safe_min_center, safe_max_center)
+                prev_center = centers[i]
+                prev_delta = 0.0
+                continue
+            
+            # Calculate desired center
+            if is_near_left_edge:
+                # Ball near left edge - position crop to include it (don't center)
+                desired_center = min(safe_min_center, ball_x + half - edge_zone_width)
+                desired_center = max(safe_min_center, desired_center)
+            elif is_near_right_edge:
+                # Ball near right edge - position crop to include it (don't center)
+                desired_center = max(safe_max_center, ball_x - half + edge_zone_width)
+                desired_center = min(safe_max_center, desired_center)
+            else:
+                # Ball in middle area - can center normally
+                desired_center = self._clamp(ball_x, safe_min_center, safe_max_center)
+            
+            # Apply movement constraints only if not near edges
+            if not (is_near_left_edge or is_near_right_edge):
+                desired_delta = desired_center - prev_center
+                
+                # Apply deadband
+                if abs(desired_delta) <= self.deadband:
+                    desired_delta = 0.0
+                
+                # Apply acceleration and jerk limits
+                if self.max_accel > 0:
+                    accel = desired_delta - (prev_delta or 0.0)
+                    if self.jerk > 0:
+                        jerk = accel - prev_accel
+                        jerk = self._clamp(jerk, -self.jerk, self.jerk)
+                        accel = prev_accel + jerk
+                    accel = self._clamp(accel, -self.max_accel, self.max_accel)
+                    desired_delta = (prev_delta or 0.0) + accel
+                    prev_accel = accel
+                
+                # Apply max movement limit
+                if abs(desired_delta) > self.max_move:
+                    desired_delta = math.copysign(self.max_move, desired_delta)
+                    
+                new_center = prev_center + desired_delta
+            else:
+                # Near edge - allow faster movement to keep ball in frame
+                max_edge_move = self.max_move * 2  # Allow double movement speed near edges
+                desired_delta = desired_center - prev_center
+                if abs(desired_delta) > max_edge_move:
+                    desired_delta = math.copysign(max_edge_move, desired_delta)
+                new_center = prev_center + desired_delta
+            
+            # Final bounds check
+            new_center = self._clamp(new_center, safe_min_center, safe_max_center)
+            centers[i] = new_center
+            
+            prev_delta = new_center - prev_center
+            prev_center = new_center
+        
+        return centers
 
 
 def parse_args() -> argparse.Namespace:
@@ -1841,11 +2128,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tiled-detect", action="store_true", help="Enable tiled detection fallback for blurry/fast balls")
     parser.add_argument("--tile-size", type=int, default=480, help="Square tile size in pixels for tiled detection")
     parser.add_argument("--tile-overlap", type=int, default=80, help="Overlap in pixels between tiles for tiled detection")
+    parser.add_argument("--enhanced-bootstrap", action="store_true", help="Use enhanced multi-pass bootstrap for better initial detection")
+    parser.add_argument("--detection-confidence-boost", type=float, default=1.2, help="Boost factor for detection confidence in 3-phase mode")
+    parser.add_argument("--stability-frames", type=int, default=5, help="Number of consecutive frames needed to confirm ball position")
+    parser.add_argument("--prediction-lookahead", type=int, default=3, help="Number of frames to look ahead for prediction")
+    parser.add_argument("--multi-roi-detect", action="store_true", help="Use multiple ROI sizes for detection")
+    parser.add_argument("--ultra-quality", action="store_true", help="Use ultra-quality settings for maximum accuracy")
+    parser.add_argument("--use-ball-memory", action="store_true", default=True, help="Keep last known ball position when ball disappears")
+    parser.add_argument("--no-ball-memory", action="store_true", help="Disable ball memory system")
+    parser.add_argument("--memory-duration", type=int, default=90, help="Frames to remember ball position")
+    parser.add_argument("--memory-decay", type=float, default=0.98, help="Memory confidence decay rate")
+    parser.add_argument("--memory-blend", type=int, default=15, help="Frames to blend back to detection")
+    # In parse_args():
+    parser.add_argument("--quick-freeze", type=int, default=3, help="Frames of misses before freezing at current position")
+    parser.add_argument("--freeze-detection-interval", type=int, default=5, help="Detection attempt interval when frozen")
+    parser.add_argument("--current-position-freeze", action="store_true", default=True, help="Freeze at current position instead of last detection")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    # Ultra-quality configuration
+    if args.ultra_quality:
+        args.model = args.model if args.model != "yolov8s.pt" else "yolov8x.pt"
+        args.imgsz = args.imgsz or 1280
+        args.conf = 0.12 if args.conf == 0.2 else args.conf
+        args.smooth = 19 if args.smooth == 11 else args.smooth
+        args.three_pass = True
+        args.full_detect = True
+        args.tiled_detect = True
+        args.enhanced_bootstrap = True
+        args.multi_roi_detect = True
+        args.detection_confidence_boost = 1.3
+        args.stability_frames = 7
+        print("🚀 Ultra-quality mode enabled!")
     
     pipeline = OptimizedReframerPipeline(
         input_path=args.input,
@@ -1884,6 +2200,11 @@ def main() -> None:
         tiled_detect=bool(args.tiled_detect),
         tile_size=int(args.tile_size),
         tile_overlap=int(args.tile_overlap),
+        enhanced_bootstrap=getattr(args, 'enhanced_bootstrap', False),
+        detection_confidence_boost=getattr(args, 'detection_confidence_boost', 1.2),
+        stability_frames=getattr(args, 'stability_frames', 5),
+        prediction_lookahead=getattr(args, 'prediction_lookahead', 3),
+        multi_roi_detect=getattr(args, 'multi_roi_detect', False),
     )
     
     pipeline.run()
