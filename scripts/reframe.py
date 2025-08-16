@@ -31,103 +31,228 @@ class VideoMeta:
     num_frames: int
     
 class BallMemorySystem:
-    """Memory system that allows one adjustment when ball disappears, then freezes"""
-    def __init__(self, memory_duration_frames: int = 90, confidence_decay: float = 0.98):
+    """Enhanced memory system with sliding window stability and forward prediction only"""
+    def __init__(self, memory_duration_frames: int = 90, confidence_decay: float = 0.98, 
+                 stability_window: int = 30, position_variance_threshold: float = 50.0):
         self.memory_duration = int(memory_duration_frames)
         self.confidence_decay = float(confidence_decay)
         
-        # Detection tracking
-        self.last_known_position: Optional[float] = None
+        # Enhanced position tracking
+        self.position_history: List[Tuple[int, float, float]] = []  # (frame, x, confidence)
         self.last_detection_frame: int = -1
-        self.memory_confidence: float = 1.0
         
-        # Frame-to-frame tracking
-        self.previous_frame_center: Optional[float] = None
-        self.had_detection_last_frame = False
+        # Sliding window for stability
+        self.stability_window = int(stability_window)
+        self.position_variance_threshold = float(position_variance_threshold)
+        self.stable_position: Optional[float] = None
+        self.stable_region_start: Optional[int] = None
         
-        # NEW: First miss handling
+        # Forward prediction only
+        self.forward_predictor = PositionPredictor()
+        
+        # Frame-to-frame stability
         self.consecutive_misses = 0
-        self.frozen_position: Optional[float] = None  # Position to freeze at after first miss
-        self.is_frozen = False
-        
-        # Motion estimation for first miss
-        self.velocity_estimate: float = 0.0
-        self.position_history: List[Tuple[int, float]] = []
+        self.freeze_position: Optional[float] = None
+        self.last_stable_position: Optional[float] = None
         
     def update_detection(self, frame_idx: int, ball_cx: float, bbox: Optional[Tuple[float, float, float, float]] = None, detection_confidence: float = 1.0):
-        """Update with detection - reset freeze state"""
-        self.last_known_position = float(ball_cx)
-        self.last_detection_frame = int(frame_idx)
-        self.memory_confidence = 1.0
-        self.previous_frame_center = float(ball_cx)
-        self.had_detection_last_frame = True
-        
-        # Reset freeze state when ball is found
+        """Update with successful detection"""
+        self.position_history.append((frame_idx, float(ball_cx), float(detection_confidence)))
+        self.last_detection_frame = frame_idx
         self.consecutive_misses = 0
-        self.frozen_position = None
-        self.is_frozen = False
+        self.freeze_position = None
         
-        # Update motion history
-        self.position_history.append((frame_idx, ball_cx))
-        if len(self.position_history) > 5:
-            self.position_history = self.position_history[-5:]
-        self._update_velocity()
-
-    def update_no_detection(self, frame_idx: int, tracker_estimate: Optional[float] = None):
-        """Update when no detection - handle first miss vs subsequent misses"""
-        self.had_detection_last_frame = False
+        # Keep limited history
+        if len(self.position_history) > 200:
+            self.position_history = self.position_history[-200:]
+            
+        # Update forward predictor only
+        self._update_predictor()
+        
+        # Update stable position
+        self._update_stable_position(frame_idx, ball_cx)
+        
+    def update_no_detection(self, frame_idx: int):
+        """Update when no detection found"""
         self.consecutive_misses += 1
         
-        if self.consecutive_misses == 1:
-            # FIRST MISS - allow adjustment using tracker/prediction
-            estimated_position = self._get_first_miss_estimate(tracker_estimate)
-            if estimated_position is not None:
-                self.frozen_position = estimated_position
-                self.previous_frame_center = estimated_position
-            self.is_frozen = False  # Not frozen yet, this is the adjustment frame
-            
-        elif self.consecutive_misses >= 2:
-            # SECOND+ MISS - freeze at the first miss position
-            if self.frozen_position is not None:
-                self.previous_frame_center = self.frozen_position
-                self.is_frozen = True
+        # For first miss, try to predict and freeze
+        if self.consecutive_misses == 1 and self.last_stable_position is not None:
+            predicted = self._predict_position_for_frame(frame_idx)
+            self.freeze_position = predicted or self.last_stable_position
         
-    def _get_first_miss_estimate(self, tracker_estimate: Optional[float]) -> Optional[float]:
-        """Get best estimate for first frame where ball is missing"""
-        # Priority 1: Use tracker estimate if available
-        if tracker_estimate is not None:
-            return float(tracker_estimate)
+    def get_position_for_frame(self, frame_idx: int) -> Optional[float]:
+        """Get best position estimate for frame"""
+        # If we have freeze position from recent miss, use it
+        if self.freeze_position is not None and self.consecutive_misses > 0:
+            return self.freeze_position
             
-        # Priority 2: Use velocity prediction
-        if self.last_known_position is not None and abs(self.velocity_estimate) > 0.5:
-            predicted = self.last_known_position + self.velocity_estimate
+        # Try forward prediction
+        predicted = self._predict_position_for_frame(frame_idx)
+        if predicted is not None:
             return predicted
             
-        # Priority 3: Use last known position
-        return self.last_known_position
+        # Fall back to stable position
+        return self.stable_position or self.last_stable_position
         
-    def get_position_for_frame(self, current_frame: int) -> Optional[float]:
-        """Get position for current frame"""
-        if self.previous_frame_center is not None:
-            return self.previous_frame_center
+    def _update_stable_position(self, frame_idx: int, position: float):
+        """Update stable position using sliding window"""
+        if len(self.position_history) < 5:
+            self.stable_position = position
+            self.last_stable_position = position
+            return
+            
+        # Get recent positions for stability check
+        recent_positions = [pos for (f, pos, conf) in self.position_history[-self.stability_window:]]
         
-        # Fallback if no previous frame
-        if self.last_known_position is not None:
-            frames_since = current_frame - self.last_detection_frame
-            if frames_since <= self.memory_duration:
-                return self.last_known_position
+        if len(recent_positions) >= 5:
+            variance = float(np.var(recent_positions))
+            
+            if variance < self.position_variance_threshold:
+                # Position is stable, update stable position
+                self.stable_position = float(np.mean(recent_positions))
+                self.stable_region_start = frame_idx - len(recent_positions) + 1
+            else:
+                # Position is moving, use weighted recent average
+                weights = np.exp(np.linspace(-1, 0, len(recent_positions)))
+                self.stable_position = float(np.average(recent_positions, weights=weights))
                 
-        return None
+        self.last_stable_position = self.stable_position
         
-    def _update_velocity(self):
-        """Update velocity estimate"""
-        if len(self.position_history) >= 2:
-            recent = self.position_history[-2:]
-            dt = recent[1][0] - recent[0][0]
+    def _update_predictor(self):
+        """Update forward predictor only"""
+        if len(self.position_history) < 3:
+            return
+            
+        frames = [f for f, pos, conf in self.position_history]
+        positions = [pos for f, pos, conf in self.position_history]
+        confidences = [conf for f, pos, conf in self.position_history]
+        
+        self.forward_predictor.update(frames, positions, confidences)
+        
+    def _predict_position_for_frame(self, frame_idx: int) -> Optional[float]:
+        """Forward prediction only for frame"""
+        if len(self.position_history) < 2:
+            return None
+            
+        # Use only forward prediction
+        forward_pred = self.forward_predictor.predict(frame_idx)
+        return forward_pred
+    
+class PositionPredictor:
+    """Forward-only position predictor with multiple prediction methods"""
+    def __init__(self, max_history: int = 50):
+        self.max_history = max_history
+        self.frames: List[int] = []
+        self.positions: List[float] = []
+        self.confidences: List[float] = []
+        
+    def update(self, frames: List[int], positions: List[float], confidences: List[float]):
+        """Update predictor with new data"""
+        self.frames = frames[-self.max_history:]
+        self.positions = positions[-self.max_history:]
+        self.confidences = confidences[-self.max_history:]
+        
+    def predict(self, target_frame: int) -> Optional[float]:
+        """Predict position for target frame using multiple forward methods"""
+        if len(self.frames) < 2:
+            return None
+            
+        predictions = []
+        
+        # Method 1: Linear extrapolation
+        linear_pred = self._linear_predict(target_frame)
+        if linear_pred is not None:
+            predictions.append((linear_pred, 0.4))
+            
+        # Method 2: Polynomial fitting
+        poly_pred = self._polynomial_predict(target_frame)
+        if poly_pred is not None:
+            predictions.append((poly_pred, 0.3))
+            
+        # Method 3: Velocity-based prediction
+        velocity_pred = self._velocity_predict(target_frame)
+        if velocity_pred is not None:
+            predictions.append((velocity_pred, 0.3))
+            
+        if not predictions:
+            return None
+            
+        # Weighted average of predictions
+        total_weight = sum(weight for _, weight in predictions)
+        weighted_sum = sum(pred * weight for pred, weight in predictions)
+        
+        return weighted_sum / total_weight
+            
+    def _linear_predict(self, target_frame: int) -> Optional[float]:
+        """Linear extrapolation prediction"""
+        if len(self.frames) < 2:
+            return None
+            
+        x = np.array(self.frames[-10:], dtype=float)
+        y = np.array(self.positions[-10:], dtype=float)
+        
+        try:
+            slope, intercept = np.polyfit(x, y, 1)
+            return float(slope * target_frame + intercept)
+        except:
+            return None
+            
+    def _polynomial_predict(self, target_frame: int) -> Optional[float]:
+        """Polynomial fitting prediction"""
+        if len(self.frames) < 4:
+            return None
+            
+        x = np.array(self.frames[-15:], dtype=float)
+        y = np.array(self.positions[-15:], dtype=float)
+        w = np.array(self.confidences[-15:], dtype=float)
+        
+        try:
+            degree = min(3, len(x) - 1)
+            coeffs = np.polyfit(x, y, deg=degree, w=w)
+            return float(np.polyval(coeffs, target_frame))
+        except:
+            return None
+            
+    def _velocity_predict(self, target_frame: int) -> Optional[float]:
+        """Velocity-based prediction with acceleration"""
+        if len(self.frames) < 3:
+            return None
+            
+        recent_frames = self.frames[-5:]
+        recent_positions = self.positions[-5:]
+        
+        if len(recent_frames) < 3:
+            return None
+            
+        # Calculate velocity and acceleration
+        velocities = []
+        for i in range(1, len(recent_frames)):
+            dt = recent_frames[i] - recent_frames[i-1]
             if dt > 0:
-                dx = recent[1][1] - recent[0][1]
-                self.velocity_estimate = dx / dt
-
+                v = (recent_positions[i] - recent_positions[i-1]) / dt
+                velocities.append(v)
+                
+        if not velocities:
+            return None
+            
+        avg_velocity = np.mean(velocities)
+        
+        # Calculate acceleration if we have enough data
+        acceleration = 0.0
+        if len(velocities) >= 2:
+            accelerations = np.diff(velocities)
+            acceleration = np.mean(accelerations)
+            
+        # Predict using kinematic equation
+        last_frame = self.frames[-1]
+        last_position = self.positions[-1]
+        dt = target_frame - last_frame
+        
+        predicted = last_position + avg_velocity * dt + 0.5 * acceleration * dt * dt
+        
+        return float(predicted)
+    
 class BlurTemplateBank:
     """Keeps a small bank of grayscale templates (sharp + blurred) for NCC matching on blurry frames."""
     def __init__(self, enabled: bool = True, max_templates: int = 12, min_similarity: float = 0.35) -> None:
@@ -312,6 +437,8 @@ class OptimizedYoloBallDetector:
         return ball_ids or [32]
 
     def _predict_on_optimized(self, frame_bgr: np.ndarray, *, conf: Optional[float] = None, imgsz: Optional[int] = None, use_tta: bool = False) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        # Ensure use_tta is a proper Python boolean
+        use_tta = bool(use_tta)
         h, w = frame_bgr.shape[:2]
         if imgsz is None:
             if h <= 480:
@@ -346,7 +473,7 @@ class OptimizedYoloBallDetector:
             iou=0.28,
             imgsz=imgsz_eff,
             half=half,
-            augment=use_tta,
+            augment=bool(use_tta),  # Ensure it's a Python boolean
             agnostic_nms=True,
         )
         if not results:
@@ -365,7 +492,7 @@ class OptimizedYoloBallDetector:
         roi_left = int(max(0, min(roi_left, W - 2)))
         roi_width = int(max(2, min(roi_width, W - roi_left)))
         roi = frame_bgr[:, roi_left : roi_left + roi_width]
-        out = self._predict_on_optimized(roi, conf=conf_override, imgsz=imgsz_override, use_tta=use_tta)
+        out = self._predict_on_optimized(roi, conf=conf_override, imgsz=imgsz_override, use_tta=bool(use_tta))
 # Add multi-scale detection fallback
         if out is None and self.allow_tta_recovery:
             for scale_factor in [1.2, 0.8, 1.5]:
@@ -733,7 +860,7 @@ class PredictiveSearchLayer:
             pref_center_x=pred,
             conf_override=max(0.08, self.detector.conf * (0.7 if misses >= 3 else 0.85)),
             imgsz_override=(960 if self.detector.device == 'mps' else (1280 if vel > 40 else 960)),
-            use_tta=(vel > 40 and self.detector.allow_tta_recovery),
+            use_tta=bool(vel > 40 and self.detector.allow_tta_recovery),
         )
         if bbox is not None:
             return bbox
@@ -792,10 +919,12 @@ class OptimizedReframerPipeline:
             conf=kwargs.get('conf', 0.2),
             imgsz=kwargs.get('imgsz')
         )
-          # Add ball memory system
+        # Add ball memory system
         self.ball_memory = BallMemorySystem(
             memory_duration_frames=int(kwargs.get('memory_duration_frames', 90)),
-            confidence_decay=float(kwargs.get('memory_confidence_decay', 0.98))
+            confidence_decay=float(kwargs.get('memory_confidence_decay', 0.98)),
+            stability_window=int(kwargs.get('stability_window', 30)),
+            position_variance_threshold=float(kwargs.get('position_variance_threshold', 50.0))
         )
         
         # Memory usage settings
@@ -993,7 +1122,7 @@ class OptimizedReframerPipeline:
         return candidate['score'] > 0.4
 
     def _first_pass_detect_track_optimized(self) -> List[Optional[float]]:
-        """Detection with first-miss adjustment, then freeze"""
+        """Enhanced detection with forward prediction and stability (no backward processing)"""
         cap = cv2.VideoCapture(self.input_path)
         if not cap.isOpened():
             raise SystemExit("Failed to open input video")
@@ -1006,108 +1135,346 @@ class OptimizedReframerPipeline:
         meta = self._read_meta(self.input_path)
         frame_w = meta.width
         
-        # Simple prediction without Kalman
-        predicted_position = frame_w / 2.0
-        
         # Enhanced bootstrap
         boot = self._bootstrap_initial_center_enhanced()
         if boot is not None:
             _, bbox0, cx0 = boot
-            predicted_position = cx0
             self.ball_memory.update_detection(boot[0], cx0, bbox0, 1.0)
         
+        # Process frames sequentially (forward only)
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         while True:
             ok, frame = cap.read()
             if not ok:
                 break
             
-            # Get prediction
+            # Get prediction from memory system
             memory_pos = self.ball_memory.get_position_for_frame(frame_idx)
-            cx_pred = memory_pos or predicted_position
+            cx_pred = memory_pos or (frame_w / 2.0)
             
-            # Detection setup
+            # Detection setup with dynamic ROI
             base_roi = int(getattr(self, 'base_roi_width', 400))
-            roi_w = int(max(200, min(frame_w, base_roi)))
+            
+            # Expand ROI if we're in unstable region
+            if self.ball_memory.consecutive_misses > 0:
+                roi_w = int(min(frame_w * 0.8, base_roi * 1.5))
+            else:
+                roi_w = int(max(200, min(frame_w, base_roi)))
+                
             roi_half = roi_w // 2
             roi_left = int(max(0, min(int(round(cx_pred)) - roi_half, frame_w - roi_w)))
             
-            # Try detection
+            # Try detection with multiple aggressive strategies
             detection_made = False
             final_position = None
-            tracker_estimate = None
             
+            # Calculate ball velocity for motion blur handling
+            ball_velocity = 0.0
+            if len(self.ball_memory.position_history) >= 2:
+                recent_positions = [pos for (f, pos, conf) in self.ball_memory.position_history[-5:]]
+                if len(recent_positions) >= 2:
+                    velocities = [abs(recent_positions[i] - recent_positions[i-1]) for i in range(1, len(recent_positions))]
+                    ball_velocity = np.mean(velocities) if velocities else 0.0
+            
+            # Expand ROI based on velocity (for fast-moving balls)
+            velocity_expansion = min(2.0, 1.0 + (ball_velocity / 50.0))  # Expand up to 2x for fast balls
+            roi_w_expanded = int(roi_w * velocity_expansion)
+            roi_half_expanded = roi_w_expanded // 2
+            roi_left_expanded = int(max(0, min(int(round(cx_pred)) - roi_half_expanded, frame_w - roi_w_expanded)))
+            
+            # Strategy 1: Primary ROI detection with velocity-adaptive confidence
+            base_conf = 0.15
+            if ball_velocity > 30:  # Lower confidence for fast-moving balls
+                base_conf = 0.10
+            elif ball_velocity > 60:  # Even lower for very fast balls
+                base_conf = 0.08
+                
             bbox = self.detector.detect_best_bbox_xyxy_in_roi_optimized(
                 frame,
-                roi_left=roi_left,
-                roi_width=roi_w,
+                roi_left=roi_left_expanded,
+                roi_width=roi_w_expanded,
                 pref_center_x=cx_pred,
-                conf_override=0.08,
-                imgsz_override=(640 if (self.detector.device == 'mps') else 960),
-                use_tta=False,
+                conf_override=base_conf,
+                imgsz_override=(960 if (self.detector.device == 'mps') else 1280),
+                use_tta=True,  # Enable TTA for better detection
             )
             
+            # Strategy 2: If primary fails, try motion-blur-optimized detection
+            if bbox is None and ball_velocity > 20:
+                # For fast-moving balls, try with motion blur preprocessing
+                bbox = self._detect_with_motion_blur_handling(
+                    frame, cx_pred, frame_w, base_conf
+                )
+            
+            # Strategy 3: If still no detection, try full-frame detection with lower confidence
+            if bbox is None:
+                bbox = self.detector._predict_on_optimized(
+                    frame,
+                    conf=0.12,  # Lower but still reasonable confidence
+                    imgsz=1280,
+                    use_tta=True
+                )
+                if bbox is not None:
+                    xys, confs, clss = bbox
+                    H, W = frame.shape[:2]
+                    best_score = -1.0
+                    best_bbox = None
+                    
+                    for c, cls_id, (x1, y1, x2, y2) in zip(confs, clss, xys):
+                        if int(cls_id) not in self.detector.ball_class_ids:
+                            continue
+                        cx = (x1 + x2) / 2.0
+                        cy = (y1 + y2) / 2.0
+                        area = max(1.0, float((x2 - x1) * (y2 - y1)))
+                        conf_score = float(c)
+                        
+                        # Distance penalty from predicted position (stronger penalty)
+                        dist_penalty = 1.0
+                        if cx_pred is not None:
+                            dist = abs(cx - float(cx_pred))
+                            # Expand search area for fast-moving balls
+                            search_radius = W / 3.0 if ball_velocity < 30 else W / 2.0
+                            norm = max(1.0, search_radius)
+                            dist_penalty = 1.0 / (1.0 + (dist / norm) ** 1.5)
+                        
+                        # Area penalty (more restrictive)
+                        area_ratio = area / (W * H)
+                        if 0.0002 < area_ratio < 0.05:  # Tighter area bounds
+                            area_penalty = 1.0
+                        elif 0.0001 < area_ratio < 0.0002:
+                            area_penalty = 0.7
+                        elif 0.05 < area_ratio < 0.08:
+                            area_penalty = 0.7
+                        else:
+                            area_penalty = 0.3
+                        
+                        # Aspect ratio penalty (ensure it's roughly circular)
+                        aspect_ratio = (x2 - x1) / max(1, y2 - y1)
+                        aspect_penalty = 1.0 / (1.0 + abs(aspect_ratio - 1.0) * 2.0)
+                        
+                        # Vertical position penalty (balls are usually in middle area)
+                        y_center_ratio = cy / H
+                        if 0.15 < y_center_ratio < 0.85:
+                            vertical_penalty = 1.0
+                        else:
+                            vertical_penalty = 0.6
+                        
+                        # Motion blur bonus (higher score for blurry objects when ball is moving fast)
+                        motion_blur_bonus = 1.0
+                        if ball_velocity > 30:
+                            # Check if the object appears blurry (low contrast)
+                            patch = frame[int(y1):int(y2), int(x1):int(x2)]
+                            if patch.size > 0:
+                                gray_patch = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+                                contrast = np.std(gray_patch)
+                                if contrast < 30:  # Low contrast = likely blurry
+                                    motion_blur_bonus = 1.2
+                        
+                        score = conf_score * dist_penalty * area_penalty * aspect_penalty * vertical_penalty * motion_blur_bonus
+                        if score > best_score:
+                            best_score = score
+                            best_bbox = (float(x1), float(y1), float(x2), float(y2))
+                    
+                    # Only accept if score is good enough
+                    if best_bbox is not None and best_score > 0.08:
+                        bbox = best_bbox
+            
+            # Strategy 4: If still no detection, try tiled detection with moderate confidence
+            if bbox is None:
+                bbox = self.detector.detect_best_bbox_xyxy_tiled(
+                    frame,
+                    tile_size=640,
+                    overlap=120,
+                    conf_override=0.12,
+                    imgsz_override=960,
+                    pref_center_x=cx_pred,
+                )
+            
+            # Strategy 5: If still no detection, try predictive recovery
+            if bbox is None and hasattr(self, 'predict_layer'):
+                try:
+                    bbox = self.predict_layer.recover(
+                        frame, 
+                        prev_cx=cx_pred, 
+                        vel=ball_velocity, 
+                        misses=self.ball_memory.consecutive_misses,
+                        frame_w=frame_w,
+                        base_roi=base_roi
+                    )
+                except Exception as e:
+                    # Skip predictive recovery if it fails
+                    bbox = None
+            
             if bbox is not None:
-                # Detection successful
-                x1, y1, x2, y2 = bbox
+                # Ensure bbox is in correct format
+                if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                    x1, y1, x2, y2 = bbox
+                else:
+                    # Skip invalid bbox
+                    bbox = None
+                    continue
+                    
                 cx_det = (x1 + x2) / 2.0
-                
-                predicted_position = cx_det
-                self.ball_memory.update_detection(frame_idx, cx_det, bbox, 1.0)
-                
                 final_position = cx_det
                 detection_made = True
                 
-                # Update trackers
+                # Update memory and trackers
+                self.ball_memory.update_detection(frame_idx, cx_det, bbox, 1.0)
                 tracker.init_with_bbox(frame, bbox)
                 flow.init_from_bbox(frame, bbox)
                 
             else:
-                # No detection - get tracker estimate for first miss
+                # Try tracker
+                tracker_estimate = None
                 ok_t, cx_t = tracker.update(frame)
                 if ok_t and cx_t is not None:
                     tracker_estimate = cx_t
-                    
-                # If no tracker, try optical flow
+                
+                # Try optical flow
                 if tracker_estimate is None:
                     cx_flow = flow.update(frame)
                     if cx_flow is not None:
                         tracker_estimate = cx_flow
                 
-                # Update memory with miss (includes tracker estimate for first miss)
-                self.ball_memory.update_no_detection(frame_idx, tracker_estimate)
+                # Update memory with miss
+                self.ball_memory.update_no_detection(frame_idx)
                 
-                # Get final position from memory
+                # Get final position from enhanced memory
                 final_position = self.ball_memory.get_position_for_frame(frame_idx)
                 
+                # Apply sliding window stability
                 if final_position is not None:
-                    predicted_position = final_position
+                    final_position = self._apply_sliding_window_stability(
+                        final_position, frame_idx, xs
+                    )
             
-            # Final fallback
-            if final_position is None:
-                final_position = predicted_position
-                
             # Store result
             xs.append(final_position)
             
-            # Logging with freeze status
+            # Update performance counters
             self._perf['frames'] += 1
             if detection_made:
                 self._perf['roi_detects'] += 1
             else:
                 self._perf['misses'] += 1
                 
+            # Progress reporting
             if self.profile and (self._perf['frames'] % 60 == 0):
                 elapsed = time.perf_counter() - self._perf['t_start']
                 fps = self._perf['frames'] / max(1e-6, elapsed)
-                freeze_status = "FROZEN" if self.ball_memory.is_frozen else "ADJUST" if self.ball_memory.consecutive_misses == 1 else "DETECT"
-                print(f"Profile@{self._perf['frames']}: fps={fps:.1f} detects={self._perf['roi_detects']} misses={self._perf['misses']} mode={freeze_status}")
+                stability = "STABLE" if self.ball_memory.stable_position is not None else "TRACKING"
+                print(f"Profile@{self._perf['frames']}: fps={fps:.1f} detects={self._perf['roi_detects']} misses={self._perf['misses']} mode={stability}")
             
             frame_idx += 1
-            
+                
         cap.release()
         return xs
 
+
+    def _apply_sliding_window_stability(self, position: float, frame_idx: int, 
+                                    previous_positions: List[Optional[float]]) -> float:
+        """Apply sliding window stability to position"""
+        if len(previous_positions) < 5:
+            return position
+        
+        # Get recent valid positions
+        recent_positions = []
+        for i in range(max(0, len(previous_positions) - 10), len(previous_positions)):
+            if previous_positions[i] is not None:
+                recent_positions.append(previous_positions[i])
+        
+        if len(recent_positions) < 3:
+            return position
+        
+        # Calculate stability metrics
+        recent_variance = np.var(recent_positions)
+        recent_mean = np.mean(recent_positions)
+        
+        # If current position is too far from recent stable area, smooth it
+        deviation = abs(position - recent_mean)
+        max_allowed_deviation = 2.0 * np.sqrt(recent_variance) + 20.0  # Dynamic threshold
+        
+        if deviation > max_allowed_deviation:
+            # Smooth the position towards recent mean
+            smoothing_factor = 0.7
+            return recent_mean * smoothing_factor + position * (1 - smoothing_factor)
+        
+        return position
+
+    def _detect_with_motion_blur_handling(self, frame: np.ndarray, cx_pred: float, frame_w: int, base_conf: float) -> Optional[Tuple[float, float, float, float]]:
+        """Specialized detection for motion-blurred balls"""
+        H, W = frame.shape[:2]
+        
+        # Create motion-blur-optimized versions of the frame
+        processed_frames = []
+        
+        # Original frame
+        processed_frames.append(frame)
+        
+        # Motion blur simulation (helps detect blurry balls)
+        try:
+            # Apply slight blur to simulate motion
+            blur_kernel = np.array([[0.1, 0.2, 0.1], [0.2, 0.2, 0.2], [0.1, 0.2, 0.1]])
+            blurred = cv2.filter2D(frame, -1, blur_kernel)
+            processed_frames.append(blurred)
+            
+            # Gaussian blur for more aggressive blur simulation
+            gaussian_blurred = cv2.GaussianBlur(frame, (0, 0), 1.5)
+            processed_frames.append(gaussian_blurred)
+        except Exception:
+            pass
+        
+        # Try detection on each processed frame
+        best_bbox = None
+        best_score = -1.0
+        
+        for proc_frame in processed_frames:
+            # Try ROI detection on processed frame
+            roi_w = int(min(frame_w * 0.6, 800))  # Larger ROI for blurry balls
+            roi_half = roi_w // 2
+            roi_left = int(max(0, min(int(round(cx_pred)) - roi_half, W - roi_w)))
+            
+            bbox = self.detector.detect_best_bbox_xyxy_in_roi_optimized(
+                proc_frame,
+                roi_left=roi_left,
+                roi_width=roi_w,
+                pref_center_x=cx_pred,
+                conf_override=base_conf * 0.8,  # Slightly lower confidence for blurry frames
+                imgsz_override=1280,
+                use_tta=True,
+            )
+            
+            if bbox is not None:
+                x1, y1, x2, y2 = bbox
+                cx = (x1 + x2) / 2.0
+                cy = (y1 + y2) / 2.0
+                area = max(1.0, float((x2 - x1) * (y2 - y1)))
+                
+                # Calculate score with blur-friendly penalties
+                dist_penalty = 1.0
+                if cx_pred is not None:
+                    dist = abs(cx - float(cx_pred))
+                    norm = max(1.0, W / 2.5)  # More lenient distance penalty for blurry balls
+                    dist_penalty = 1.0 / (1.0 + (dist / norm) ** 1.2)
+                
+                area_ratio = area / (W * H)
+                if 0.0001 < area_ratio < 0.08:  # More lenient area bounds for blurry balls
+                    area_penalty = 1.0
+                else:
+                    area_penalty = 0.5
+                
+                aspect_ratio = (x2 - x1) / max(1, y2 - y1)
+                aspect_penalty = 1.0 / (1.0 + abs(aspect_ratio - 1.0) * 1.5)  # More lenient aspect ratio
+                
+                score = dist_penalty * area_penalty * aspect_penalty
+                if score > best_score:
+                    best_score = score
+                    best_bbox = bbox
+        
+        # Ensure we return a valid bbox format
+        if best_bbox is not None and isinstance(best_bbox, (list, tuple)) and len(best_bbox) == 4:
+            return best_bbox
+        return None
 
     @staticmethod
     def _read_meta(path: str) -> VideoMeta:
@@ -1473,11 +1840,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prediction-lookahead", type=int, default=3, help="Number of frames to look ahead for prediction")
     parser.add_argument("--multi-roi-detect", action="store_true", help="Use multiple ROI sizes for detection")
     parser.add_argument("--ultra-quality", action="store_true", help="Use ultra-quality settings for maximum accuracy")
+    parser.add_argument("--ultra-aggressive", action="store_true", help="Use ultra-aggressive detection with multiple fallback strategies")
+    parser.add_argument("--motion-blur-mode", action="store_true", help="Enable specialized detection for fast-moving, blurry balls")
     parser.add_argument("--use-ball-memory", action="store_true", default=True, help="Keep last known ball position when ball disappears")
     parser.add_argument("--no-ball-memory", action="store_true", help="Disable ball memory system")
     parser.add_argument("--memory-duration", type=int, default=90, help="Frames to remember ball position")
     parser.add_argument("--memory-decay", type=float, default=0.98, help="Memory confidence decay rate")
     parser.add_argument("--memory-blend", type=int, default=15, help="Frames to blend back to detection")
+    # Add these lines in the parse_args() function:
+    parser.add_argument("--stability-window", type=int, default=30, help="Window size for position stability calculation")
+    parser.add_argument("--position-variance-threshold", type=float, default=50.0, help="Variance threshold for stable position detection")
     # In parse_args():
 
     return parser.parse_args()
@@ -1499,6 +1871,25 @@ def main() -> None:
         args.detection_confidence_boost = 1.3
         args.stability_frames = 7
         print("🚀 Ultra-quality mode enabled!")
+    
+    # Ultra-aggressive configuration
+    if args.ultra_aggressive:
+        args.model = args.model if args.model != "yolov8s.pt" else "yolov8x.pt"
+        args.imgsz = args.imgsz or 1280
+        args.conf = 0.12 if args.conf == 0.2 else args.conf  # More reasonable confidence
+        args.smooth = 15 if args.smooth == 11 else args.smooth
+        args.three_pass = True
+        args.full_detect = True
+        args.tiled_detect = True
+        args.enhanced_bootstrap = True
+        args.multi_roi_detect = True
+        args.detection_confidence_boost = 1.3  # Reduced from 1.5
+        args.stability_frames = 3
+        args.detect_every_frame = True
+        args.use_ball_memory = True
+        args.memory_duration_frames = 120  # Reduced from 150
+        args.memory_confidence_decay = 0.99  # More reasonable decay
+        print("🔥 Ultra-aggressive detection mode enabled!")
     
     pipeline = OptimizedReframerPipeline(
         input_path=args.input,
@@ -1541,6 +1932,9 @@ def main() -> None:
         stability_frames=getattr(args, 'stability_frames', 5),
         prediction_lookahead=getattr(args, 'prediction_lookahead', 3),
         multi_roi_detect=getattr(args, 'multi_roi_detect', False),
+        # Add these lines to the OptimizedReframerPipeline constructor call in main():
+        stability_window=getattr(args, 'stability_window', 30),
+        position_variance_threshold=getattr(args, 'position_variance_threshold', 50.0),
     )
     
     pipeline.run()

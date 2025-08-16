@@ -50,10 +50,14 @@ interface ProcessingArgs {
   predictionLookahead?: number;
   multiRoiDetect?: boolean;
   ultraQuality?: boolean;
+  ultraAggressive?: boolean;
+  motionBlurMode?: boolean;
   useBallMemory?: boolean;
   memoryDurationFrames?: number;
   memoryConfidenceDecay?: number;
   memoryBlendFrames?: number;
+  stabilityWindow?: number;
+  positionVarianceThreshold?: number;
 }
 
 class ArgsParser {
@@ -248,6 +252,12 @@ Examples:
         case "--ultra-quality":
           args.maxAccuracy = true;
           break;
+        case "--ultra-aggressive":
+          args.ultraAggressive = true;
+          break;
+        case "--motion-blur-mode":
+          args.motionBlurMode = true;
+          break;
         case "-h":
         case "--help":
           args.help = true;
@@ -266,6 +276,12 @@ Examples:
           break;
         case "--memory-blend":
           args.memoryBlendFrames = parseInt(next());
+          break;
+        case "--stability-window":
+          args.stabilityWindow = parseInt(next());
+          break;
+        case "--position-variance-threshold":
+          args.positionVarianceThreshold = parseFloat(next());
           break;
 
         default:
@@ -313,6 +329,25 @@ class PythonRunner {
       args.multiRoiDetect = true;
       args.detectionConfidenceBoost = args.detectionConfidenceBoost ?? 1.3;
       args.stabilityFrames = args.stabilityFrames ?? 7;
+      args.backend = args.backend || "yolo-bytetrack";
+      args.useFfmpeg = args.useFfmpeg ?? true;
+      args.profile = args.profile ?? true;
+    } else if (args.ultraAggressive) {
+      args.model = args.model || "yolov8x.pt";
+      args.imgsz = args.imgsz ?? 1280;
+      args.conf = args.conf ?? 0.12; // More reasonable confidence
+      args.smooth = args.smooth ?? 15;
+      args.threePass = true;
+      args.fullDetect = true;
+      args.tiledDetect = true;
+      args.enhancedBootstrap = true;
+      args.multiRoiDetect = true;
+      args.detectionConfidenceBoost = args.detectionConfidenceBoost ?? 1.3; // Reduced from 1.5
+      args.stabilityFrames = args.stabilityFrames ?? 3;
+      args.detectEveryFrame = true;
+      args.useBallMemory = true;
+      args.memoryDurationFrames = args.memoryDurationFrames ?? 120; // Reduced from 150
+      args.memoryConfidenceDecay = args.memoryConfidenceDecay ?? 0.99; // More reasonable decay
       args.backend = args.backend || "yolo-bytetrack";
       args.useFfmpeg = args.useFfmpeg ?? true;
       args.profile = args.profile ?? true;
@@ -413,6 +448,22 @@ class PythonRunner {
     if (args.predictionLookahead !== undefined)
       pyArgs.push("--prediction-lookahead", String(args.predictionLookahead));
     if (args.multiRoiDetect) pyArgs.push("--multi-roi-detect");
+    if (args.ultraAggressive) pyArgs.push("--ultra-aggressive");
+    if (args.useBallMemory) pyArgs.push("--use-ball-memory");
+    if (args.memoryDurationFrames !== undefined)
+      pyArgs.push("--memory-duration", String(args.memoryDurationFrames));
+    if (args.memoryConfidenceDecay !== undefined)
+      pyArgs.push("--memory-decay", String(args.memoryConfidenceDecay));
+    if (args.memoryBlendFrames !== undefined)
+      pyArgs.push("--memory-blend", String(args.memoryBlendFrames));
+    if (args.stabilityWindow !== undefined)
+      pyArgs.push("--stability-window", String(args.stabilityWindow));
+    if (args.positionVarianceThreshold !== undefined)
+      pyArgs.push(
+        "--position-variance-threshold",
+        String(args.positionVarianceThreshold)
+      );
+    if (args.motionBlurMode) pyArgs.push("--motion-blur-mode");
 
     return pyArgs;
   }
