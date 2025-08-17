@@ -83,23 +83,12 @@ Detection/Tracking Options:
 Advanced:
   --profile                 Print periodic profiling info (FPS/misses)
   --no-tta-recovery         Disable heavy TTA full-frame recoveries for speed
-  --verbose                 Show detailed progress
-  --dry-run                 Show command without running
-Edge Handling:
-  --edge-aware              Smart crop positioning when ball is near frame edges
-  --ball-comfort-zone <px>  Minimum distance from ball to crop edge (default: 15% of crop width)
-
 Ball Memory Options:
   --use-ball-memory         Keep last known ball position when ball disappears (default: true)
   --no-ball-memory          Disable ball memory system
   --memory-duration <int>   Frames to remember ball position (default: 90)
   --memory-decay <float>    Memory confidence decay rate (default: 0.98)
   --memory-blend <int>      Frames to blend back to detection (default: 15)
-
-  Offscreen Ball Handling:
-  --freeze-on-exit          Freeze crop area when ball exits screen (default: true)
-  --freeze-threshold <int>  Frames of misses before freezing (default: 5)
-  --exit-prediction         Use trajectory prediction for ball return (default: true)
 
 Examples:
   # Basic usage
@@ -243,12 +232,6 @@ Examples:
                 case "--help":
                     args.help = true;
                     break;
-                case "--edge-aware":
-                    args.edgeAware = true;
-                    break;
-                case "--ball-comfort-zone":
-                    args.ballComfortZone = parseInt(next());
-                    break;
                 case "--use-ball-memory":
                     args.useBallMemory = true;
                     break;
@@ -263,15 +246,6 @@ Examples:
                     break;
                 case "--memory-blend":
                     args.memoryBlendFrames = parseInt(next());
-                    break;
-                case "--freeze-on-exit":
-                    args.freezeOnExit = true;
-                    break;
-                case "--freeze-threshold":
-                    args.freezeThreshold = parseInt(next());
-                    break;
-                case "--exit-prediction":
-                    args.exitPrediction = true;
                     break;
                 default:
                     console.warn(`Unknown arg: ${a}`);

@@ -190,7 +190,7 @@ Examples:
         case "--no-appearance":
           args.noAppearance = true;
           break;
-        case "--profile":
+        case "--profile": 
           args.profile = true;
           break;
         case "--no-tta-recovery":

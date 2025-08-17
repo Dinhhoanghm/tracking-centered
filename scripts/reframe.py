@@ -232,6 +232,15 @@ class OptimizedYoloBallDetector:
         self.ref_hist: Optional[np.ndarray] = None
         # Optional external template bank injected by pipeline
         self.template_bank: Optional[BlurTemplateBank] = None
+            # 🆕 ADD: Enhanced tennis ball specific settings
+        self.tennis_ball_confidence_boost = 1.3  # Boost tennis ball detections
+        self.distraction_penalty = 0.7  # Penalize non-tennis objects
+        self.temporal_consistency_buffer = []  # Track recent detections
+        self.false_positive_memory = set()  # Remember false positive locations
+        
+        # 🆕 ADD: Enhanced template matching for tennis balls
+        self.tennis_templates = []  # Specific tennis ball templates
+        self.template_update_frequency = 30  # Update templates every 30 frames
         self._warmup_model()
 
     def set_target_appearance(self, class_id: Optional[int], ref_hist: Optional[np.ndarray]) -> None:
@@ -366,7 +375,6 @@ class OptimizedYoloBallDetector:
         roi_width = int(max(2, min(roi_width, W - roi_left)))
         roi = frame_bgr[:, roi_left : roi_left + roi_width]
         out = self._predict_on_optimized(roi, conf=conf_override, imgsz=imgsz_override, use_tta=use_tta)
-# Add multi-scale detection fallback
         if out is None and self.allow_tta_recovery:
             for scale_factor in [1.2, 0.8, 1.5]:
                 h, w = roi.shape[:2]
@@ -442,14 +450,21 @@ class OptimizedYoloBallDetector:
                     templ_term = sim
             except Exception:
                 templ_term = 0.0
+            tennis_ball_boost = 1.0
+            if self._is_tennis_ball_like(frame_bgr, (x1, y1, x2, y2)):
+                tennis_ball_boost = self.tennis_ball_confidence_boost
+                
+            temporal_score = self._check_temporal_consistency((x1, y1, x2, y2))
+            fp_penalty = self._check_false_positive_memory((x1, y1, x2, y2))
             score = (
-                    conf_score * 0.35 +
-                    conf_score * dist_penalty * 0.25 +
-                    conf_score * area_penalty * 0.12 +
-                    conf_score * aspect_penalty * 0.1 +
-                    (hist_term * 0.13 if getattr(self, 'ref_hist', None) is not None else 0.0) +
-                    (templ_term * 0.15 if templ_term is not None else 0.0)
-                )
+                conf_score * tennis_ball_boost * 0.30 +  # Boost tennis balls
+                conf_score * dist_penalty * 0.20 +
+                conf_score * area_penalty * 0.15 +
+                conf_score * aspect_penalty * 0.10 +
+                temporal_score * 0.15 +  # Reward consistent detections
+                (hist_term * 0.10 if getattr(self, 'ref_hist', None) is not None else 0.0) +
+                fp_penalty * 0.10  # Penalize known false positives
+            )
             if score > best_score:
                 best_score = score
                 best_bbox = (float(x1 + roi_left_effective), float(y1), float(x2 + roi_left_effective), float(y2))
@@ -495,9 +510,313 @@ class OptimizedYoloBallDetector:
                         best_score = score
                         best_bbox = (float(x + x1), float(y + y1), float(x + x2), float(y + y2))
         return best_bbox
+    
+        # Add this AFTER the existing __init__ method of OptimizedYoloBallDetector class
+    def detect_with_nms_filtering(self, frame_bgr: np.ndarray, aggressive_nms: bool = True) -> Optional[Tuple[float, float, float, float]]:
+        """Enhanced detection with aggressive NMS - PERFORMANCE OPTIMIZED"""
+        
+        if frame_bgr is None:
+            return None
+        
+        # ✅ PERFORMANCE: Only use 1-2 scales instead of 3
+        scales = [1.0, 1.1] if aggressive_nms else [1.0]  # Reduced from [1.0, 1.2, 0.8]
+        
+        # ✅ PERFORMANCE: Only use 2 confidence levels instead of 3
+        conf_levels = [self.conf, self.conf * 0.8] if aggressive_nms else [self.conf]  # Reduced from 3 levels
+        
+        all_detections = []
+        
+        for scale in scales:
+            for conf_level in conf_levels:
+                h, w = frame_bgr.shape[:2]
+                
+                if scale != 1.0:
+                    new_h, new_w = int(h * scale), int(w * scale)
+                    scaled_frame = cv2.resize(frame_bgr, (new_w, new_h))
+                else:
+                    new_h, new_w = h, w
+                    scaled_frame = frame_bgr
+                
+                out = self._predict_on_optimized(
+                    scaled_frame, 
+                    conf=conf_level,
+                    imgsz=min(960, max(640, int(max(new_w, new_h)))),  # ✅ PERFORMANCE: Reduced max size
+                    use_tta=False  # ✅ PERFORMANCE: Disable TTA for speed
+                )
+                
+                if out is not None:
+                    xys, confs, clss = out
+                    
+                    if scale != 1.0:
+                        xys = xys / scale
+                    
+                    for c, cls_id, (x1, y1, x2, y2) in zip(confs, clss, xys):
+                        if int(cls_id) in self.ball_class_ids:
+                            all_detections.append({
+                                'bbox': (float(x1), float(y1), float(x2), float(y2)),
+                                'conf': float(c),
+                                'cls_id': int(cls_id),
+                                'area': (x2-x1) * (y2-y1),
+                                'cx': (x1+x2)/2,
+                                'cy': (y1+y2)/2
+                            })
+                    
+                    # ✅ PERFORMANCE: Break early if we found good detections
+                    if len(all_detections) >= 3:  # Stop if we have enough candidates
+                        break
+            
+            if len(all_detections) >= 2:  # Don't try more scales if we have detections
+                break
+        
+        if not all_detections:
+            return None
+        
+        # Apply custom NMS with ball-specific logic
+        filtered_detections = self._apply_ball_specific_nms(all_detections, frame_bgr.shape)
+        
+        if not filtered_detections:
+            return None
+        
+        # Select best detection
+        best_det = max(filtered_detections, key=lambda x: self._score_detection_in_context(x, frame_bgr))
+        
+        return best_det['bbox']
 
 
+    def _apply_ball_specific_nms(self, detections, frame_shape, iou_threshold=0.3):
+        """Apply ball-specific non-maximum suppression"""
+        if len(detections) <= 1:
+            return detections
+        
+        H, W = frame_shape[:2]
+        
+        # Sort by confidence
+        detections.sort(key=lambda x: x['conf'], reverse=True)
+        
+        keep = []
+        used_indices = set()
+        
+        for i, det in enumerate(detections):
+            if i in used_indices:
+                continue
+            
+            keep.append(det)
+            
+            # Suppress overlapping detections
+            for j, other in enumerate(detections[i+1:], i+1):
+                if j in used_indices:
+                    continue
+                
+                # Calculate IoU
+                iou = self._calculate_iou(det['bbox'], other['bbox'])
+                
+                # Calculate spatial distance
+                dx = abs(det['cx'] - other['cx'])
+                dy = abs(det['cy'] - other['cy'])
+                spatial_dist = np.sqrt(dx*dx + dy*dy) / min(W, H)
+                
+                # Suppress if too similar
+                if iou > iou_threshold or spatial_dist < 0.05:
+                    used_indices.add(j)
+        
+        return keep
 
+    def _calculate_iou(self, bbox1, bbox2):
+        """Calculate Intersection over Union"""
+        x1_1, y1_1, x2_1, y2_1 = bbox1
+        x1_2, y1_2, x2_2, y2_2 = bbox2
+        
+        # Calculate intersection
+        x1_i = max(x1_1, x1_2)
+        y1_i = max(y1_1, y1_2)
+        x2_i = min(x2_1, x2_2)
+        y2_i = min(y2_1, y2_2)
+        
+        if x2_i <= x1_i or y2_i <= y1_i:
+            return 0.0
+        
+        intersection = (x2_i - x1_i) * (y2_i - y1_i)
+        area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
+        area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
+        union = area1 + area2 - intersection
+        
+        return intersection / max(union, 1e-6)
+
+    def _score_detection_in_context(self, detection, frame_bgr):
+        """Score detection considering context and surroundings"""
+        bbox = detection['bbox']
+        x1, y1, x2, y2 = bbox
+        H, W = frame_bgr.shape[:2]
+        
+        base_score = detection['conf']
+        
+        # 1. Size appropriateness
+        area = detection['area']
+        area_ratio = area / (W * H)
+        if 0.0008 < area_ratio < 0.02:
+            size_score = 1.0
+        elif 0.0003 < area_ratio < 0.04:
+            size_score = 0.8
+        else:
+            size_score = 0.4
+        
+        # 2. Aspect ratio (balls should be roughly square)
+        aspect = (x2-x1) / max(1, y2-y1)
+        aspect_score = 1.0 / (1.0 + abs(aspect - 1.0))
+        
+        # 3. Position reasonableness
+        cx, cy = detection['cx'], detection['cy']
+        
+        # Avoid extreme edges
+        edge_margin = min(W, H) * 0.03
+        if (cx < edge_margin or cx > W-edge_margin or 
+            cy < edge_margin or cy > H-edge_margin):
+            position_score = 0.5
+        else:
+            position_score = 1.0
+        
+        # 4. Context analysis - check surrounding area
+        context_score = self._analyze_detection_context(frame_bgr, bbox)
+        
+        return base_score * 0.4 + base_score * size_score * 0.2 + base_score * aspect_score * 0.2 + base_score * position_score * 0.1 + context_score * 0.1
+
+    def _analyze_detection_context(self, frame_bgr, bbox):
+        """Analyze the context around a detection to validate it's likely a ball"""
+        try:
+            x1, y1, x2, y2 = bbox
+            H, W = frame_bgr.shape[:2]
+            
+            # Expand bbox to get context
+            pad = max(20, int(min(x2-x1, y2-y1) * 0.5))
+            ctx_x1 = max(0, int(x1) - pad)
+            ctx_y1 = max(0, int(y1) - pad)
+            ctx_x2 = min(W, int(x2) + pad)
+            ctx_y2 = min(H, int(y2) + pad)
+            
+            context_patch = frame_bgr[ctx_y1:ctx_y2, ctx_x1:ctx_x2]
+            ball_patch = frame_bgr[int(y1):int(y2), int(x1):int(x2)]
+            
+            if context_patch.size == 0 or ball_patch.size == 0:
+                return 0.5
+            
+            # 1. Color contrast - ball should contrast with background
+            ball_mean = np.mean(ball_patch, axis=(0,1))
+            context_mean = np.mean(context_patch, axis=(0,1))
+            contrast = np.linalg.norm(ball_mean - context_mean) / 255.0
+            contrast_score = min(1.0, contrast * 2.0)
+            
+            # 2. Edge strength - balls usually have clear edges
+            gray_ball = cv2.cvtColor(ball_patch, cv2.COLOR_BGR2GRAY)
+            edges = cv2.Canny(gray_ball, 50, 150)
+            edge_density = np.sum(edges > 0) / edges.size
+            edge_score = min(1.0, edge_density * 10.0)
+            
+            return (contrast_score * 0.6 + edge_score * 0.4)
+            
+        except Exception:
+            return 0.5
+    def _is_tennis_ball_like(self, frame_bgr: np.ndarray, bbox: Tuple[float, float, float, float]) -> bool:
+        """🆕 ADD: Detect tennis ball specific characteristics"""
+        try:
+            x1, y1, x2, y2 = bbox
+            H, W = frame_bgr.shape[:2]
+            
+            # Extract patch
+            patch = frame_bgr[int(max(0, y1)):int(min(H, y2)), 
+                            int(max(0, x1)):int(min(W, x2))]
+            if patch.size < 50:
+                return False
+                
+            # Tennis ball color detection (yellow-green range)
+            hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+            
+            # Tennis ball HSV ranges
+            lower_tennis = np.array([25, 70, 70])   # Yellow-green
+            upper_tennis = np.array([85, 255, 255])
+            
+            mask = cv2.inRange(hsv, lower_tennis, upper_tennis)
+            tennis_color_ratio = np.sum(mask > 0) / mask.size
+            
+            # Size check - tennis balls have typical size range
+            area = (x2 - x1) * (y2 - y1)
+            area_ratio = area / (W * H)
+            size_appropriate = 0.0002 < area_ratio < 0.02
+            
+            # Circularity check
+            gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+            contours, _ = cv2.findContours(gray, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            circularity = 0.0
+            if contours:
+                largest = max(contours, key=cv2.contourArea)
+                if cv2.contourArea(largest) > 20:
+                    perimeter = cv2.arcLength(largest, True)
+                    if perimeter > 0:
+                        circularity = 4 * np.pi * cv2.contourArea(largest) / (perimeter * perimeter)
+            
+            # Tennis ball criteria
+            return (tennis_color_ratio > 0.15 and size_appropriate and circularity > 0.6)
+            
+        except Exception:
+            return False
+
+    def _check_temporal_consistency(self, bbox: Tuple[float, float, float, float]) -> float:
+        """🆕 ADD: Check if detection is consistent with recent frames"""
+        x1, y1, x2, y2 = bbox
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+        
+        # Add current detection to buffer
+        self.temporal_consistency_buffer.append((cx, cy))
+        if len(self.temporal_consistency_buffer) > 10:
+            self.temporal_consistency_buffer.pop(0)
+        
+        if len(self.temporal_consistency_buffer) < 3:
+            return 0.5
+        
+        # Calculate consistency score based on recent positions
+        recent_positions = self.temporal_consistency_buffer[-5:]
+        distances = []
+        
+        for i in range(1, len(recent_positions)):
+            prev_x, prev_y = recent_positions[i-1]
+            curr_x, curr_y = recent_positions[i]
+            dist = np.sqrt((curr_x - prev_x)**2 + (curr_y - prev_y)**2)
+            distances.append(dist)
+        
+        if not distances:
+            return 0.5
+            
+        # Reward smooth motion, penalize erratic jumps
+        avg_movement = np.mean(distances)
+        if avg_movement < 50:  # Smooth motion
+            return 1.0
+        elif avg_movement < 100:  # Moderate motion
+            return 0.8
+        else:  # Erratic motion
+            return 0.3
+
+    def _check_false_positive_memory(self, bbox: Tuple[float, float, float, float]) -> float:
+        """🆕 ADD: Penalize known false positive locations"""
+        x1, y1, x2, y2 = bbox
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+        
+        # Check against known false positive locations
+        for fp_x, fp_y in self.false_positive_memory:
+            dist = np.sqrt((cx - fp_x)**2 + (cy - fp_y)**2)
+            if dist < 80:  # Close to known false positive
+                return 0.5
+        
+        return 1.0
+
+    def update_false_positive_memory(self, bbox: Tuple[float, float, float, float]):
+        """🆕 ADD: Remember false positive locations"""
+        x1, y1, x2, y2 = bbox
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+        self.false_positive_memory.add((cx, cy))
+        
+        # Keep memory size manageable
+        if len(self.false_positive_memory) > 50:
+            self.false_positive_memory = set(list(self.false_positive_memory)[-30:])
 
 
 class ParallelBoxTracker:
@@ -682,6 +1001,52 @@ class PredictiveSearchLayer:
         n = len(self.history)
         if n == 0:
             return None
+            # 🆕 CHANGE: Enhanced prediction for longer videos
+        if n >= 12:  # More history for better prediction
+            xs = np.arange(n, dtype=float)
+            ys = np.array(self.history, dtype=float)
+            
+            # 🆕 ADD: Adaptive weighting based on video length
+            decay_rate = 0.95 if n > 900 else 0.98  # Faster decay for long videos
+            weights = np.exp(np.linspace(-3, 0, min(n, 20)))[-n:] * decay_rate
+            
+            try:
+                # 🆕 CHANGE: Use more recent frames for fitting
+                recent_frames = min(15, n)  # Increased from 8 to 15
+                
+                # 🆕 ADD: Detect if ball is accelerating (bouncing, changing direction)
+                if n >= 6:
+                    recent_velocities = np.diff(ys[-6:])
+                    velocity_change = np.std(recent_velocities)
+                    
+                    if velocity_change > 20:  # Ball is changing direction rapidly
+                        # Use shorter prediction window
+                        recent_frames = min(8, n)
+                        poly_degree = 1  # Linear prediction for rapid changes
+                    else:
+                        poly_degree = min(2, recent_frames-1)
+                else:
+                    poly_degree = min(2, recent_frames-1)
+                
+                coeffs = np.polyfit(
+                    xs[-recent_frames:], 
+                    ys[-recent_frames:], 
+                    deg=poly_degree,
+                    w=weights[-recent_frames:]
+                )
+                x_next = float(n)
+                predicted = float(np.polyval(coeffs, x_next))
+                
+                # 🆕 ADD: Momentum-based correction for tennis ball physics
+                if n >= 4:
+                    recent_velocity = np.mean(np.diff(ys[-4:]))
+                    # Apply physics-based momentum (tennis balls maintain trajectory)
+                    momentum_factor = 0.4 if abs(recent_velocity) > 25 else 0.3
+                    predicted += recent_velocity * momentum_factor
+                
+                return predicted
+            except Exception:
+                pass
         
         if n >= 8:
             xs = np.arange(n, dtype=float)
@@ -779,6 +1144,86 @@ class PredictiveSearchLayer:
         return None
 
 
+class TrajectoryLearner:
+    """🆕 ADD: Learn ball trajectory patterns for better prediction"""
+    def __init__(self, frame_width: int):
+        self.frame_width = frame_width
+        self.detections = []  # (frame_idx, cx, confidence)
+        self.pattern_confidence = 0.0
+        self.velocity_history = []
+        self.acceleration_history = []
+        
+    def add_detection(self, frame_idx: int, cx: float, high_confidence: bool = False):
+        """Add a detection to the trajectory"""
+        confidence = 1.0 if high_confidence else 0.8
+        self.detections.append((frame_idx, cx, confidence))
+        
+        # Keep recent history
+        if len(self.detections) > 200:
+            self.detections = self.detections[-200:]
+        
+        self._update_motion_patterns()
+    
+    def add_miss(self, frame_idx: int, estimated_pos: Optional[float]):
+        """Handle a detection miss"""
+        if estimated_pos is not None:
+            self.detections.append((frame_idx, estimated_pos, 0.3))
+    
+    def predict_position(self, frame_idx: int) -> Optional[float]:
+        """Predict ball position for given frame"""
+        if len(self.detections) < 3:
+            return None
+        
+        # Use recent detections for prediction
+        recent = self.detections[-10:]
+        frames = [d[0] for d in recent]
+        positions = [d[1] for d in recent]
+        weights = [d[2] for d in recent]
+        
+        try:
+            # Weighted polynomial fit
+            coeffs = np.polyfit(frames, positions, deg=min(2, len(recent)-1), w=weights)
+            predicted = float(np.polyval(coeffs, frame_idx))
+            
+            # Apply motion constraints
+            if len(self.velocity_history) > 0:
+                avg_velocity = np.mean(self.velocity_history[-5:])
+                predicted += avg_velocity * 0.2  # Add momentum
+            
+            # Bound to frame
+            return max(0, min(self.frame_width, predicted))
+        except:
+            # Fallback to last known position
+            return self.detections[-1][1] if self.detections else None
+    
+    def _update_motion_patterns(self):
+        """Update motion pattern understanding"""
+        if len(self.detections) < 3:
+            return
+        
+        # Calculate velocities
+        recent = self.detections[-5:]
+        for i in range(1, len(recent)):
+            dt = recent[i][0] - recent[i-1][0]
+            if dt > 0:
+                dx = recent[i][1] - recent[i-1][1]
+                velocity = dx / dt
+                self.velocity_history.append(velocity)
+        
+        # Keep velocity history manageable
+        if len(self.velocity_history) > 50:
+            self.velocity_history = self.velocity_history[-50:]
+        
+        # Update confidence based on pattern consistency
+        if len(self.velocity_history) >= 5:
+            velocity_std = np.std(self.velocity_history[-10:])
+            # Lower std = more consistent = higher confidence
+            self.pattern_confidence = max(0.0, min(1.0, 1.0 - velocity_std / 50.0))
+    
+    def get_confidence(self) -> float:
+        """Get trajectory learning confidence"""
+        return self.pattern_confidence
+    
 class OptimizedReframerPipeline:
     def __init__(self, **kwargs):
         # Copy all existing parameters
@@ -797,6 +1242,16 @@ class OptimizedReframerPipeline:
             memory_duration_frames=int(kwargs.get('memory_duration_frames', 90)),
             confidence_decay=float(kwargs.get('memory_confidence_decay', 0.98))
         )
+                # 🆕 ADD: Enhanced settings for longer videos
+        self.long_video_threshold = 600  # 20 seconds at 30fps
+        self.enhanced_detection_interval = 60  # Enhanced detection every 60 frames for long videos
+        self.temporal_validation_window = 15  # Frames to validate detections
+        
+        # 🆕 ADD: Tennis ball specific settings
+        self.tennis_ball_mode = kwargs.get('tennis_ball_mode', True)
+        if self.tennis_ball_mode:
+            self.detector.conf *= 0.8  # Lower confidence for tennis balls (they're fast)
+            self.ball_memory.memory_duration = int(kwargs.get('memory_duration_frames', 120))  # Longer memory
         
         # Memory usage settings
         self.use_ball_memory = bool(kwargs.get('use_ball_memory', True))
@@ -875,81 +1330,537 @@ class OptimizedReframerPipeline:
 
 
     def _bootstrap_initial_center_enhanced(self) -> Optional[Tuple[int, Tuple[float, float, float, float], float]]:
-        """Enhanced bootstrap with multi-confidence and temporal consistency"""
+        """🆕 ENHANCED: Multi-stage bootstrap with cross-validation"""
         meta = self._read_meta(self.input_path)
         cap = cv2.VideoCapture(self.input_path)
         if not cap.isOpened():
             return None
         
         candidates = []
-        frames_to_scan = min(getattr(self, 'bootstrap_frames', 48), meta.num_frames or 48)
+        frames_to_scan = min(getattr(self, 'bootstrap_frames', 60), meta.num_frames or 60)
         
-        conf_thresholds = [0.15, 0.1, 0.05] if getattr(self, 'enhanced_bootstrap', False) else [0.1]
+        print(f"🔍 Enhanced bootstrap: scanning {frames_to_scan} frames...")
         
-        for conf_thresh in conf_thresholds:
-            step = max(1, frames_to_scan // 30)
+        # 🆕 Phase 1: Multi-confidence detection passes
+        confidence_strategies = [
+            {'conf': 0.03, 'imgsz': 1280, 'name': 'ultra_sensitive', 'weight': 0.8},
+            {'conf': 0.08, 'imgsz': 960, 'name': 'sensitive', 'weight': 1.0},
+            {'conf': 0.15, 'imgsz': 640, 'name': 'standard', 'weight': 1.2},
+        ]
+        
+        step_size = max(1, frames_to_scan // 30)  # More thorough scanning
+        
+        for idx in range(0, frames_to_scan, step_size):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ok, frame = cap.read()
+            if not ok:
+                break
             
-            for idx in range(0, frames_to_scan, step):
-                cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-                ok, frame = cap.read()
-                if not ok:
-                    break
+            H, W = frame.shape[:2]
+            
+            # 🆕 Try each confidence strategy
+            for strategy in confidence_strategies:
+                # Full frame detection
+                out = self.detector._predict_on_optimized(
+                    frame, 
+                    conf=strategy['conf'],
+                    imgsz=strategy['imgsz'],
+                    use_tta=(idx < 20)  # Use TTA only for first frames
+                )
                 
-                detection_strategies = [
-                    {'conf': conf_thresh, 'imgsz': 960},
-                    {'conf': conf_thresh * 0.8, 'imgsz': 1280},
-                ]
-                
-                for strategy in detection_strategies:
-                    out = self.detector._predict_on_optimized(
-                        frame, 
-                        conf=strategy['conf'],
-                        imgsz=strategy['imgsz'],
-                        use_tta=True
-                    )
-                    
-                    if out is None:
-                        continue
-                    
+                if out is not None:
                     xys, confs, clss = out
-                    H, W = frame.shape[:2]
                     
                     for c, cls_id, (x1, y1, x2, y2) in zip(confs, clss, xys):
                         if int(cls_id) not in self.detector.ball_class_ids:
                             continue
                         
-                        score = self._compute_bootstrap_score(frame, (x1, y1, x2, y2), c, W, H)
+                        # 🆕 Multi-factor validation
+                        validation_score = self._validate_detection_thoroughly(
+                            frame, (x1, y1, x2, y2), c, W, H, idx, strategy['name']
+                        )
                         
-                        candidates.append({
-                            'frame': idx,
-                            'bbox': (float(x1), float(y1), float(x2), float(y2)),
-                            'cx': (float(x1) + float(x2)) / 2.0,
-                            'score': score,
-                            'conf': float(c),
-                            'strategy': strategy
-                        })
+                        if validation_score > 0.3:  # Lower threshold but better validation
+                            candidates.append({
+                                'frame': idx,
+                                'bbox': (float(x1), float(y1), float(x2), float(y2)),
+                                'cx': (float(x1) + float(x2)) / 2.0,
+                                'cy': (float(y1) + float(y2)) / 2.0,
+                                'score': validation_score * strategy['weight'],
+                                'conf': float(c),
+                                'strategy': strategy['name'],
+                                'area': (x2-x1) * (y2-y1),
+                                'aspect': (x2-x1) / max(1, y2-y1),
+                                'validation_details': self._get_validation_details(frame, (x1, y1, x2, y2))
+                            })
+                
+                if len(candidates) >= 15:  # Collect more candidates
+                    break
+            
+            if len(candidates) >= 20:
+                break
         
         cap.release()
         
         if not candidates:
+            print("❌ No ball candidates found in enhanced bootstrap")
             return None
         
-        candidates.sort(key=lambda x: x['score'], reverse=True)
+        print(f"📊 Found {len(candidates)} candidates, selecting best...")
         
-        best_candidate = None
-        for candidate in candidates[:10]:
-            if self._verify_temporal_consistency(candidate):
-                best_candidate = candidate
-                break
-        
-        if best_candidate is None and candidates:
-            best_candidate = candidates[0]
+        # 🆕 Phase 2: Cross-validation and consensus
+        best_candidate = self._select_best_candidate_with_consensus(candidates, meta)
         
         if best_candidate:
+            print(f"✅ Selected ball at frame {best_candidate['frame']} "
+                f"(score: {best_candidate['score']:.3f}, validation: {best_candidate['strategy']})")
             return (best_candidate['frame'], best_candidate['bbox'], best_candidate['cx'])
         
         return None
+    
+    def _validate_detection_thoroughly(self, frame, bbox, conf, W, H, frame_idx, strategy_name):
+        """🆕 ADD: Comprehensive detection validation"""
+        x1, y1, x2, y2 = bbox
+        cx = (float(x1) + float(x2)) / 2.0
+        cy = (float(y1) + float(y2)) / 2.0
+        area = max(1.0, float((x2 - x1) * (y2 - y1)))
+        
+        validation_scores = []
+        
+        # 1. 🆕 Tennis ball color validation (most important)
+        tennis_ball_score = 0.0
+        try:
+            patch = frame[int(max(0, y1)):int(min(H, y2)), 
+                        int(max(0, x1)):int(min(W, x2))]
+            if patch.size > 50:
+                hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+                
+                # Multiple tennis ball color ranges
+                yellow_green_mask = cv2.inRange(hsv, np.array([25, 50, 50]), np.array([85, 255, 255]))
+                bright_yellow_mask = cv2.inRange(hsv, np.array([15, 100, 100]), np.array([35, 255, 255]))
+                
+                yellow_green_ratio = np.sum(yellow_green_mask > 0) / yellow_green_mask.size
+                bright_yellow_ratio = np.sum(bright_yellow_mask > 0) / bright_yellow_mask.size
+                
+                tennis_ball_score = max(yellow_green_ratio, bright_yellow_ratio) * 2.0
+                if tennis_ball_score > 0.2:  # Strong tennis ball color
+                    tennis_ball_score = min(1.0, tennis_ball_score * 1.5)
+        except:
+            pass
+        
+        validation_scores.append(('tennis_color', tennis_ball_score, 0.4))
+        
+        # 2. 🆕 Size appropriateness (critical for filtering noise)
+        area_ratio = area / (W * H)
+        size_score = 0.0
+        if 0.0003 < area_ratio < 0.03:  # Ideal tennis ball size range
+            size_score = 1.0
+        elif 0.0001 < area_ratio < 0.0003:  # Too small but possible
+            size_score = 0.4
+        elif 0.03 < area_ratio < 0.06:  # Too large but possible
+            size_score = 0.6
+        else:  # Definitely wrong size
+            size_score = 0.1
+        
+        validation_scores.append(('size', size_score, 0.25))
+        
+        # 3. 🆕 Circularity validation
+        circularity_score = 0.0
+        try:
+            patch = frame[int(max(0, y1)):int(min(H, y2)), 
+                        int(max(0, x1)):int(min(W, x2))]
+            if patch.size > 100:
+                gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+                
+                # Edge-based circularity
+                edges = cv2.Canny(gray, 30, 100)
+                contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                
+                if contours:
+                    largest = max(contours, key=cv2.contourArea)
+                    if cv2.contourArea(largest) > 50:
+                        perimeter = cv2.arcLength(largest, True)
+                        if perimeter > 0:
+                            circularity = 4 * np.pi * cv2.contourArea(largest) / (perimeter * perimeter)
+                            circularity_score = min(1.0, circularity * 1.3)
+        except:
+            pass
+        
+        validation_scores.append(('circularity', circularity_score, 0.2))
+        
+        # 4. 🆕 Position reasonableness
+        edge_margin = min(W, H) * 0.05
+        position_score = 1.0
+        
+        # Penalize extreme edges heavily
+        if (cx < edge_margin or cx > W - edge_margin or 
+            cy < edge_margin or cy > H - edge_margin):
+            position_score = 0.2
+        
+        # Penalize very top/bottom (balls rarely there in tennis)
+        if cy < H * 0.1 or cy > H * 0.9:
+            position_score *= 0.3
+        
+        validation_scores.append(('position', position_score, 0.15))
+        
+        # 5. 🆕 Confidence scaling based on strategy
+        conf_score = float(conf)
+        if strategy_name == 'ultra_sensitive' and conf_score < 0.05:
+            conf_score *= 0.5  # Penalize very low confidence detections
+        
+        # 6. Calculate weighted final score
+        final_score = 0.0
+        total_weight = 0.0
+        
+        for name, score, weight in validation_scores:
+            final_score += score * weight
+            total_weight += weight
+        
+        # Add confidence component
+        final_score += conf_score * 0.1
+        total_weight += 0.1
+        
+        return final_score / total_weight if total_weight > 0 else 0.0
 
+    def _get_validation_details(self, frame, bbox):
+        """🆕 ADD: Get detailed validation info for debugging"""
+        x1, y1, x2, y2 = bbox
+        try:
+            patch = frame[int(max(0, y1)):int(min(frame.shape[0], y2)), 
+                        int(max(0, x1)):int(min(frame.shape[1], x2))]
+            if patch.size > 50:
+                hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+                mean_hue = np.mean(hsv[:, :, 0])
+                mean_sat = np.mean(hsv[:, :, 1])
+                mean_val = np.mean(hsv[:, :, 2])
+                
+                return {
+                    'mean_hue': float(mean_hue),
+                    'mean_sat': float(mean_sat),
+                    'mean_val': float(mean_val),
+                    'patch_size': patch.size
+                }
+        except:
+            pass
+        return {}
+
+    def _select_best_candidate_with_consensus(self, candidates, meta):
+        """🆕 ADD: Advanced candidate selection with consensus"""
+        if not candidates:
+            return None
+        
+        # Sort by validation score
+        candidates.sort(key=lambda x: x['score'], reverse=True)
+        
+        # 🆕 Consensus-based selection
+        # Group candidates by location and time
+        consensus_groups = []
+        used = set()
+        
+        for i, cand in enumerate(candidates):
+            if i in used:
+                continue
+            
+            group = [cand]
+            used.add(i)
+            
+            # Find spatially and temporally close candidates
+            for j, other in enumerate(candidates[i+1:], i+1):
+                if j in used:
+                    continue
+                
+                # Spatial proximity
+                dx = abs(cand['cx'] - other['cx'])
+                dy = abs(cand['cy'] - other['cy'])
+                
+                # Temporal proximity
+                dt = abs(cand['frame'] - other['frame'])
+                
+                if dx < 80 and dy < 80 and dt < 20:  # Close in space and time
+                    group.append(other)
+                    used.add(j)
+            
+            if len(group) >= 2:  # Only consider groups with multiple detections
+                consensus_groups.append(group)
+        
+        if consensus_groups:
+            # Score each consensus group
+            best_group = None
+            best_group_score = 0
+            
+            for group in consensus_groups:
+                # Group metrics
+                avg_score = sum(c['score'] for c in group) / len(group)
+                consistency = len(group)
+                max_score = max(c['score'] for c in group)
+                
+                # Tennis ball color consistency in group
+                tennis_scores = []
+                for candidate in group:
+                    details = candidate.get('validation_details', {})
+                    if 'mean_hue' in details:
+                        hue = details['mean_hue']
+                        sat = details['mean_sat']
+                        # Tennis ball hue range
+                        if 25 <= hue <= 85 and sat > 50:
+                            tennis_scores.append(1.0)
+                        else:
+                            tennis_scores.append(0.0)
+                
+                tennis_consistency = np.mean(tennis_scores) if tennis_scores else 0.0
+                
+                group_score = (avg_score * 0.4 + 
+                            max_score * 0.3 + 
+                            consistency * 0.1 + 
+                            tennis_consistency * 0.2)
+                
+                if group_score > best_group_score:
+                    best_group_score = group_score
+                    best_group = group
+            
+            if best_group:
+                # Return best candidate from best consensus group
+                return max(best_group, key=lambda x: x['score'])
+        
+        # Fallback: return single best candidate with high enough score
+        if candidates[0]['score'] > 0.5:
+            return candidates[0]
+        
+        return None
+    
+    def _compute_enhanced_bootstrap_score(self, frame, bbox, conf, W, H, frame_idx):
+        """Enhanced scoring that filters out non-ball objects"""
+        x1, y1, x2, y2 = bbox
+        cx = (float(x1) + float(x2)) / 2.0
+        cy = (float(y1) + float(y2)) / 2.0
+        area = max(1.0, float((x2 - x1) * (y2 - y1)))
+        conf_score = float(conf)
+        
+        # 1. Size filtering - balls should be reasonable size
+        area_ratio = area / (W * H)
+        if area_ratio < 0.00008:  # Too small (likely noise)
+            return 0.1
+        elif area_ratio > 0.08:   # Too large (likely person/equipment)
+            return 0.1
+        elif 0.0005 < area_ratio < 0.025:  # Good ball size range
+            area_penalty = 1.0
+        else:
+            area_penalty = 0.6
+        
+        # 2. Aspect ratio - balls should be roughly circular
+        aspect_ratio = (x2 - x1) / max(1, y2 - y1)
+        if 0.7 < aspect_ratio < 1.4:  # Roughly square/circular
+            aspect_penalty = 1.0
+        elif 0.5 < aspect_ratio < 2.0:  # Acceptable range
+            aspect_penalty = 0.8
+        else:  # Likely not a ball
+            aspect_penalty = 0.2
+        
+        # 3. Position filtering - avoid extreme edges where balls are unlikely
+        edge_margin = min(W, H) * 0.05
+        if (cx < edge_margin or cx > W - edge_margin or 
+            cy < edge_margin or cy > H - edge_margin):
+            edge_penalty = 0.4
+        else:
+            edge_penalty = 1.0
+        
+        # 4. Vertical position - balls usually not at very top/bottom
+        y_ratio = cy / H
+        if 0.15 < y_ratio < 0.85:  # Good vertical range
+            vertical_penalty = 1.0
+        elif 0.05 < y_ratio < 0.95:  # Acceptable range  
+            vertical_penalty = 0.7
+        else:  # Very top/bottom
+            vertical_penalty = 0.3
+        
+        # 5. Center preference (balls often in center of action)
+        center_dist = abs(cx - W/2) / (W/2)
+        center_penalty = 1.0 / (1.0 + center_dist * 0.3)
+        
+        # 6. Frame position bonus (later frames often have better ball visibility)
+        frame_bonus = 1.0 + (frame_idx / 1000.0) * 0.2
+        
+        # 7. Color/texture analysis for ball-like appearance
+        try:
+            patch = frame[int(max(0, y1)):int(min(H, y2)), 
+                        int(max(0, x1)):int(min(W, x2))]
+            appearance_score = self._analyze_ball_appearance(patch)
+        except:
+            appearance_score = 0.5
+        
+        # Combine all factors
+        final_score = (
+            conf_score * 0.25 +
+            conf_score * area_penalty * 0.20 +
+            conf_score * aspect_penalty * 0.15 +
+            conf_score * edge_penalty * 0.10 +
+            conf_score * vertical_penalty * 0.10 +
+            conf_score * center_penalty * 0.10 +
+            appearance_score * 0.05 +
+            frame_bonus * 0.05
+        )
+        
+        return final_score
+
+    def _analyze_ball_appearance(self, patch):
+        """Analyze patch for ball-like visual characteristics"""
+        if patch is None or patch.size < 50:
+            return 0.3
+        
+        try:
+            # Convert to different color spaces for analysis
+            gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+            hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+            
+            # 1. Check for circular/round edges
+            edges = cv2.Canny(gray, 50, 150)
+            contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            circularity_score = 0.3
+            if contours:
+                largest_contour = max(contours, key=cv2.contourArea)
+                if cv2.contourArea(largest_contour) > 20:
+                    perimeter = cv2.arcLength(largest_contour, True)
+                    if perimeter > 0:
+                        circularity = 4 * np.pi * cv2.contourArea(largest_contour) / (perimeter * perimeter)
+                        circularity_score = min(1.0, circularity * 1.2)
+            
+            # 2. Check color consistency (balls usually have consistent color)
+            h, s, v = cv2.split(hsv)
+            color_consistency = 1.0 - (np.std(h) / 180.0 + np.std(s) / 255.0) / 2.0
+            color_consistency = max(0.0, min(1.0, color_consistency))
+            
+            # 3. Check for typical ball colors (avoid skin tones, clothing colors)
+            mean_hue = np.mean(h)
+            mean_sat = np.mean(s)
+            
+            # Boost score for typical ball colors
+            ball_color_bonus = 1.0
+            if (10 < mean_hue < 25) and (mean_sat > 100):  # Orange (basketball)
+                ball_color_bonus = 1.3
+            elif (30 < mean_hue < 70) and (mean_sat > 80):   # Yellow-green (tennis)
+                ball_color_bonus = 1.2
+            elif (100 < mean_hue < 120) and (mean_sat > 60): # Blue
+                ball_color_bonus = 1.1
+            elif mean_sat < 50:  # Low saturation (white/gray balls)
+                ball_color_bonus = 1.1
+            
+            return (circularity_score * 0.4 + color_consistency * 0.4 + 0.2) * ball_color_bonus
+            
+        except Exception:
+            return 0.4
+
+    def _select_best_bootstrap_candidate(self, candidates, meta):
+        """Advanced candidate selection with temporal validation"""
+        if not candidates:
+            return None
+        
+        # Sort by score first
+        candidates.sort(key=lambda x: x['score'], reverse=True)
+        
+        # Group candidates by spatial proximity
+        candidate_groups = []
+        used = set()
+        
+        for i, cand in enumerate(candidates):
+            if i in used:
+                continue
+                
+            group = [cand]
+            used.add(i)
+            
+            # Find nearby candidates (same general area)
+            for j, other in enumerate(candidates[i+1:], i+1):
+                if j in used:
+                    continue
+                    
+                dx = abs(cand['cx'] - other['cx'])
+                dy = abs(cand['cy'] - other['cy'])
+                
+                if dx < 100 and dy < 100:  # Within 100px
+                    group.append(other)
+                    used.add(j)
+            
+            candidate_groups.append(group)
+        
+        # Score each group
+        best_group = None
+        best_group_score = 0
+        
+        for group in candidate_groups:
+            # Group scoring factors
+            avg_score = sum(c['score'] for c in group) / len(group)
+            consistency = len(group)  # More detections = more consistent
+            temporal_spread = max(c['frame'] for c in group) - min(c['frame'] for c in group)
+            
+            group_score = avg_score * (1 + consistency * 0.1) * (1 + temporal_spread * 0.001)
+            
+            if group_score > best_group_score:
+                best_group_score = group_score
+                best_group = group
+        
+        if best_group:
+            # Return the highest scoring candidate from the best group
+            return max(best_group, key=lambda x: x['score'])
+        
+        return candidates[0] if candidates else None
+
+    def _enhanced_first_frame_detection(self):
+        """Try multiple strategies to detect ball in first few frames"""
+        cap = cv2.VideoCapture(self.input_path)
+        if not cap.isOpened():
+            return None
+        
+        strategies = [
+            {'frames': range(0, 30, 2), 'conf': 0.05, 'imgsz': 1280, 'aggressive_nms': True},
+            {'frames': range(0, 60, 5), 'conf': 0.08, 'imgsz': 960, 'aggressive_nms': True}, 
+            {'frames': range(0, 90, 10), 'conf': 0.12, 'imgsz': 640, 'aggressive_nms': False},
+        ]
+        
+        best_detection = None
+        best_score = 0
+        
+        for strategy in strategies:
+            for frame_idx in strategy['frames']:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                
+                # Temporarily adjust detector settings
+                original_conf = self.detector.conf
+                original_imgsz = getattr(self.detector, 'imgsz', None)
+                
+                self.detector.conf = strategy['conf']
+                self.detector.imgsz = strategy['imgsz']
+                
+                bbox = self.detector.detect_with_nms_filtering(frame, strategy['aggressive_nms'])
+                
+                # Restore original settings
+                self.detector.conf = original_conf
+                self.detector.imgsz = original_imgsz
+                
+                if bbox is not None:
+                    x1, y1, x2, y2 = bbox
+                    score = self._compute_enhanced_bootstrap_score(
+                        frame, bbox, strategy['conf'], frame.shape[1], frame.shape[0], frame_idx
+                    )
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_detection = {
+                            'frame': frame_idx,
+                            'bbox': bbox,
+                            'cx': (x1 + x2) / 2.0,
+                            'score': score
+                        }
+        
+        cap.release()
+        
+        if best_detection and best_detection['score'] > 0.4:
+            return (best_detection['frame'], best_detection['bbox'], best_detection['cx'])
+        
+        return None
     def _compute_bootstrap_score(self, frame, bbox, conf, W, H):
         """Compute enhanced bootstrap score"""
         x1, y1, x2, y2 = bbox
@@ -993,7 +1904,7 @@ class OptimizedReframerPipeline:
         return candidate['score'] > 0.4
 
     def _first_pass_detect_track_optimized(self) -> List[Optional[float]]:
-        """Detection with first-miss adjustment, then freeze"""
+        """🆕 ENHANCED: Better integration of Phase 1 and Phase 2"""
         cap = cv2.VideoCapture(self.input_path)
         if not cap.isOpened():
             raise SystemExit("Failed to open input video")
@@ -1006,80 +1917,104 @@ class OptimizedReframerPipeline:
         meta = self._read_meta(self.input_path)
         frame_w = meta.width
         
-        # Simple prediction without Kalman
-        predicted_position = frame_w / 2.0
+        # 🆕 Enhanced trajectory learning
+        trajectory_learner = TrajectoryLearner(frame_w)
         
         # Enhanced bootstrap
-        boot = self._bootstrap_initial_center_enhanced()
+        boot = self._enhanced_first_frame_detection()
+        if boot is None:
+            boot = self._bootstrap_initial_center_enhanced()
+        
         if boot is not None:
             _, bbox0, cx0 = boot
             predicted_position = cx0
             self.ball_memory.update_detection(boot[0], cx0, bbox0, 1.0)
+            trajectory_learner.add_detection(boot[0], cx0, high_confidence=True)
+            print(f"🎯 Initial ball position: {cx0:.1f} at frame {boot[0]}")
+        else:
+            predicted_position = frame_w / 2.0
+            print("⚠️  No initial ball found, using center prediction")
+        
+        # 🆕 Early learning phase (first 5 seconds)
+        early_learning_frames = min(150, meta.num_frames or 150)
+        detection_validation_threshold = 0.4  # Higher threshold during learning
         
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         while True:
             ok, frame = cap.read()
-            if not ok:
+            if not ok or frame is None:
                 break
             
-            # Get prediction
+            # Get prediction from multiple sources
             memory_pos = self.ball_memory.get_position_for_frame(frame_idx)
-            cx_pred = memory_pos or predicted_position
+            trajectory_pos = trajectory_learner.predict_position(frame_idx)
             
-            # Detection setup
-            base_roi = int(getattr(self, 'base_roi_width', 400))
-            roi_w = int(max(200, min(frame_w, base_roi)))
-            roi_half = roi_w // 2
-            roi_left = int(max(0, min(int(round(cx_pred)) - roi_half, frame_w - roi_w)))
+            # Combine predictions intelligently
+            if memory_pos is not None and trajectory_pos is not None:
+                # Weight based on confidence and recency
+                memory_weight = 0.6 if self.ball_memory.consecutive_misses < 3 else 0.3
+                trajectory_weight = 1.0 - memory_weight
+                cx_pred = memory_pos * memory_weight + trajectory_pos * trajectory_weight
+            else:
+                cx_pred = memory_pos or trajectory_pos or predicted_position
             
-            # Try detection
+            # 🆕 Adaptive detection strategy based on learning phase
+            if frame_idx < early_learning_frames:
+                # Learning phase: more thorough detection
+                bbox = self._learning_phase_detection(frame, cx_pred, frame_idx)
+            else:
+                # Normal phase: standard detection
+                bbox = self._standard_detection(frame, cx_pred, frame_idx)
+            
             detection_made = False
             final_position = None
-            tracker_estimate = None
-            
-            bbox = self.detector.detect_best_bbox_xyxy_in_roi_optimized(
-                frame,
-                roi_left=roi_left,
-                roi_width=roi_w,
-                pref_center_x=cx_pred,
-                conf_override=0.08,
-                imgsz_override=(640 if (self.detector.device == 'mps') else 960),
-                use_tta=False,
-            )
             
             if bbox is not None:
-                # Detection successful
+                # Validate detection before accepting
                 x1, y1, x2, y2 = bbox
-                cx_det = (x1 + x2) / 2.0
+                validation_score = self._validate_detection_thoroughly(
+                    frame, bbox, 0.5, frame_w, frame.shape[0], frame_idx, 'runtime'
+                )
                 
-                predicted_position = cx_det
-                self.ball_memory.update_detection(frame_idx, cx_det, bbox, 1.0)
-                
-                final_position = cx_det
-                detection_made = True
-                
-                # Update trackers
-                tracker.init_with_bbox(frame, bbox)
-                flow.init_from_bbox(frame, bbox)
-                
-            else:
-                # No detection - get tracker estimate for first miss
+                if validation_score > detection_validation_threshold or frame_idx < 30:
+                    # Accept detection
+                    cx_det = (x1 + x2) / 2.0
+                    predicted_position = cx_det
+                    self.ball_memory.update_detection(frame_idx, cx_det, bbox, validation_score)
+                    trajectory_learner.add_detection(frame_idx, cx_det, validation_score > 0.7)
+                    
+                    final_position = cx_det
+                    detection_made = True
+                    
+                    # Update trackers
+                    tracker.init_with_bbox(frame, bbox)
+                    flow.init_from_bbox(frame, bbox)
+                    
+                    # Lower validation threshold as we learn
+                    if frame_idx > 50:
+                        detection_validation_threshold = max(0.25, detection_validation_threshold * 0.999)
+                else:
+                    # Reject low-quality detection
+                    self.detector.update_false_positive_memory(bbox)
+                    bbox = None
+            
+            if bbox is None:
+                # Handle miss with enhanced fallback
+                tracker_estimate = None
                 ok_t, cx_t = tracker.update(frame)
                 if ok_t and cx_t is not None:
                     tracker_estimate = cx_t
                     
-                # If no tracker, try optical flow
                 if tracker_estimate is None:
                     cx_flow = flow.update(frame)
                     if cx_flow is not None:
                         tracker_estimate = cx_flow
                 
-                # Update memory with miss (includes tracker estimate for first miss)
+                # Update systems
                 self.ball_memory.update_no_detection(frame_idx, tracker_estimate)
+                trajectory_learner.add_miss(frame_idx, tracker_estimate)
                 
-                # Get final position from memory
                 final_position = self.ball_memory.get_position_for_frame(frame_idx)
-                
                 if final_position is not None:
                     predicted_position = final_position
             
@@ -1087,25 +2022,20 @@ class OptimizedReframerPipeline:
             if final_position is None:
                 final_position = predicted_position
                 
-            # Store result
             xs.append(final_position)
             
-            # Logging with freeze status
+            # Progress tracking
             self._perf['frames'] += 1
             if detection_made:
                 self._perf['roi_detects'] += 1
             else:
                 self._perf['misses'] += 1
                 
-            if self.profile and (self._perf['frames'] % 60 == 0):
-                elapsed = time.perf_counter() - self._perf['t_start']
-                fps = self._perf['frames'] / max(1e-6, elapsed)
-                freeze_status = "FROZEN" if self.ball_memory.is_frozen else "ADJUST" if self.ball_memory.consecutive_misses == 1 else "DETECT"
-                print(f"Profile@{self._perf['frames']}: fps={fps:.1f} detects={self._perf['roi_detects']} misses={self._perf['misses']} mode={freeze_status}")
-            
             frame_idx += 1
             
         cap.release()
+        
+        print(f"📈 Trajectory learning: {trajectory_learner.get_confidence():.2f} confidence")
         return xs
 
 
@@ -1345,6 +2275,54 @@ class OptimizedReframerPipeline:
         avg_hist = sum_hist_by_class[best_c] / max(1e-6, weight_by_class[best_c])
         avg_hist = cv2.normalize(avg_hist, avg_hist).flatten()
         self.detector.set_target_appearance(best_c, avg_hist)
+    def _learning_phase_detection(self, frame, cx_pred, frame_idx):
+        """🆕 ADD: Enhanced detection during learning phase"""
+        H, W = frame.shape[:2]
+        
+        # Try multiple detection strategies
+        strategies = [
+            {'roi_width': 300, 'conf': 0.05, 'imgsz': 960},
+            {'roi_width': 500, 'conf': 0.08, 'imgsz': 640},
+            {'roi_width': W, 'conf': 0.12, 'imgsz': 640},  # Full frame fallback
+        ]
+        
+        for strategy in strategies:
+            roi_w = strategy['roi_width']
+            roi_half = roi_w // 2
+            roi_left = int(max(0, min(int(round(cx_pred)) - roi_half, W - roi_w)))
+            
+            bbox = self.detector.detect_best_bbox_xyxy_in_roi_optimized(
+                frame,
+                roi_left=roi_left,
+                roi_width=roi_w,
+                pref_center_x=cx_pred,
+                conf_override=strategy['conf'],
+                imgsz_override=strategy['imgsz'],
+                use_tta=False
+            )
+            
+            if bbox is not None:
+                return bbox
+        
+        return None
+
+    def _standard_detection(self, frame, cx_pred, frame_idx):
+        """🆕 ADD: Standard detection for normal operation"""
+        H, W = frame.shape[:2]
+        base_roi = int(getattr(self, 'base_roi_width', 400))
+        roi_w = int(max(200, min(W, base_roi)))
+        roi_half = roi_w // 2
+        roi_left = int(max(0, min(int(round(cx_pred)) - roi_half, W - roi_w)))
+        
+        return self.detector.detect_best_bbox_xyxy_in_roi_optimized(
+            frame,
+            roi_left=roi_left,
+            roi_width=roi_w,
+            pref_center_x=cx_pred,
+            conf_override=0.08,
+            imgsz_override=(640 if (self.detector.device == 'mps') else 960),
+            use_tta=False,
+        )
 
 
 # Import remaining classes from original code
