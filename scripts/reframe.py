@@ -1223,7 +1223,45 @@ class TrajectoryLearner:
     def get_confidence(self) -> float:
         """Get trajectory learning confidence"""
         return self.pattern_confidence
+
+class LengthAdaptiveStrategy:
+    def __init__(self, total_frames: int, fps: float = 30.0):
+        self.total_frames = total_frames
+        self.duration_seconds = total_frames / fps
+        self.strategy = self._select_strategy()
+        
+    def _select_strategy(self) -> dict:
+        if self.duration_seconds <= 25:
+            # 20s videos: Current optimal settings
+            return {
+                'confidence_decay_rate': 0.9995,
+                'late_video_boost': False,
+                'reset_learning_at': None,
+            }
+        else:
+            # 30s+ videos: Prevent late degradation
+            return {
+                'confidence_decay_rate': 0.9998,  # Slower decay
+                'late_video_boost': True,
+                'reset_learning_at': 0.7,  # Reset at 70% through video
+            }
     
+    def get_confidence_threshold(self, frame_idx: int, base_confidence: float, learning_confidence: float) -> float:
+        progress = frame_idx / self.total_frames
+        
+        if self.strategy.get('late_video_boost') and progress > 0.7:
+            # Boost detection in final 30% for long videos
+            boost_factor = 1.3
+            return base_confidence * boost_factor
+        
+        # Normal decay logic
+        if frame_idx > 50 and learning_confidence > 0.5:
+            decay_rate = self.strategy['confidence_decay_rate']
+            return max(0.2, base_confidence * (decay_rate ** (frame_idx - 50)))
+        
+        return base_confidence
+    
+        
 class OptimizedReframerPipeline:
     def __init__(self, **kwargs):
         # Copy all existing parameters
@@ -1237,6 +1275,7 @@ class OptimizedReframerPipeline:
             conf=kwargs.get('conf', 0.2),
             imgsz=kwargs.get('imgsz')
         )
+        self.adaptive_strategy = None  # Will be set during processing
           # Add ball memory system
         self.ball_memory = BallMemorySystem(
             memory_duration_frames=int(kwargs.get('memory_duration_frames', 90)),
@@ -1916,6 +1955,10 @@ class OptimizedReframerPipeline:
         frame_idx = 0
         meta = self._read_meta(self.input_path)
         frame_w = meta.width
+
+        # 🆕 ADD: Length-adaptive strategy
+        self.adaptive_strategy = LengthAdaptiveStrategy(meta.num_frames, meta.fps)
+        print(f"🎯 Using strategy for {self.adaptive_strategy.duration_seconds:.1f}s video")
         
         # 🆕 Enhanced trajectory learning
         trajectory_learner = TrajectoryLearner(frame_w)
@@ -1938,7 +1981,18 @@ class OptimizedReframerPipeline:
         # 🆕 Early learning phase (first 5 seconds)
         early_learning_frames = min(150, meta.num_frames or 150)
         detection_validation_threshold = 0.4  # Higher threshold during learning
-        
+        # 🆕 ADD: Length-adaptive learning reset
+        if self.adaptive_strategy.strategy.get('reset_learning_at'):
+            reset_frame = int(meta.num_frames * self.adaptive_strategy.strategy['reset_learning_at'])
+            if frame_idx == reset_frame:
+                detection_validation_threshold = 0.4  # Reset to original learning threshold
+                print(f"🔄 Reset learning at frame {frame_idx} (70% through video)")
+
+        # Lower validation threshold as we learn
+        if frame_idx > 50:
+            decay_rate = self.adaptive_strategy.strategy['confidence_decay_rate']
+            detection_validation_threshold = max(0.25, detection_validation_threshold * decay_rate)
+                
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         while True:
             ok, frame = cap.read()
